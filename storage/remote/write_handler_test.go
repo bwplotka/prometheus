@@ -280,10 +280,10 @@ func TestRemoteWriteHandler_V1Message(t *testing.T) {
 
 		for _, hp := range ts.Histograms {
 			if hp.IsFloatHistogram() {
-				fh := FloatHistogramProtoToFloatHistogram(hp)
+				fh := hp.ToFloatHistogram()
 				requireEqual(t, mockHistogram{labels, hp.Timestamp, nil, fh}, appendable.histograms[k])
 			} else {
-				h := HistogramProtoToHistogram(hp)
+				h := hp.ToIntHistogram()
 				requireEqual(t, mockHistogram{labels, hp.Timestamp, h, nil}, appendable.histograms[k])
 			}
 
@@ -317,8 +317,9 @@ func TestRemoteWriteHandler_V2Message(t *testing.T) {
 	k := 0
 	// the reduced write request is equivalent to the write request fixture.
 	// we can use it for
+	b := labels.NewScratchBuilder(0)
 	for _, ts := range writeV2RequestFixture.Timeseries {
-		ls := writev2.DesymbolizeLabels(ts.LabelsRefs, writeV2RequestFixture.Symbols)
+		ls := ts.ModelLabels(&b, writeV2RequestFixture.Symbols)
 		for _, s := range ts.Samples {
 			require.Equal(t, mockSample{ls, s.Timestamp, s.Value}, appendable.samples[i])
 			i++
@@ -332,10 +333,10 @@ func TestRemoteWriteHandler_V2Message(t *testing.T) {
 
 		for _, hp := range ts.Histograms {
 			if hp.IsFloatHistogram() {
-				fh := FloatHistogramProtoV2ToFloatHistogram(hp)
+				fh := hp.ToFloatHistogram()
 				require.Equal(t, mockHistogram{ls, hp.Timestamp, nil, fh}, appendable.histograms[k])
 			} else {
-				h := HistogramProtoV2ToHistogram(hp)
+				h := hp.ToIntHistogram()
 				require.Equal(t, mockHistogram{ls, hp.Timestamp, h, nil}, appendable.histograms[k])
 			}
 
@@ -442,7 +443,7 @@ func TestOutOfOrderExemplar_V2Message(t *testing.T) {
 func TestOutOfOrderHistogram_V1Message(t *testing.T) {
 	payload, _, _, err := buildWriteRequest(nil, []prompb.TimeSeries{{
 		Labels:     []prompb.Label{{Name: "__name__", Value: "test_metric"}},
-		Histograms: []prompb.Histogram{HistogramToHistogramProto(0, &testHistogram), FloatHistogramToHistogramProto(1, testHistogram.ToFloat(nil))},
+		Histograms: []prompb.Histogram{prompb.FromIntHistogram(0, &testHistogram), prompb.FromFloatHistogram(1, testHistogram.ToFloat(nil))},
 	}}, nil, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
@@ -462,7 +463,7 @@ func TestOutOfOrderHistogram_V1Message(t *testing.T) {
 func TestOutOfOrderHistogram_V2Message(t *testing.T) {
 	payload, _, _, err := buildV2WriteRequest(nil, []writev2.TimeSeries{{
 		LabelsRefs: []uint32{0, 1},
-		Histograms: []writev2.Histogram{HistogramToV2HistogramProto(0, &testHistogram), FloatHistogramToV2HistogramProto(1, testHistogram.ToFloat(nil))},
+		Histograms: []writev2.Histogram{writev2.FromIntHistogram(0, &testHistogram), writev2.FromFloatHistogram(1, testHistogram.ToFloat(nil))},
 	}}, []string{"__name__", "metric1"}, nil, nil, nil, "snappy") // TODO(bwplotka): No empty string!
 	require.NoError(t, err)
 
@@ -493,7 +494,7 @@ func BenchmarkRemoteWriteHandler(b *testing.B) {
 				{Name: "__name__", Value: "test_metric"},
 				{Name: "test_label_name_" + num, Value: labelValue + num},
 			},
-			Histograms: []prompb.Histogram{HistogramToHistogramProto(0, &testHistogram)},
+			Histograms: []prompb.Histogram{prompb.FromIntHistogram(0, &testHistogram)},
 		}}, nil, nil, nil, nil, "snappy")
 		require.NoError(b, err)
 		req, err := http.NewRequest("", "", bytes.NewReader(buf))
