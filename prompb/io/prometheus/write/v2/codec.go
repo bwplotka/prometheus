@@ -166,3 +166,14 @@ func (m Exemplar) ToExemplar(b *labels.ScratchBuilder, symbols []string) exempla
 		HasTs:  timestamp != 0,
 	}
 }
+
+func (m TimeSeries) GetSamples2() []Sample {
+	return m.GetSamples()
+}
+
+func (m Sample) GetValue2() float64 {
+	return m.GetValue()
+}
+func (m Sample) GetTimestamp2() int64 {
+	return m.GetTimestamp()
+}
