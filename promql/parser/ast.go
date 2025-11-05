@@ -23,6 +23,8 @@ import (
 	"github.com/prometheus/prometheus/storage"
 )
 
+type prettyMode string
+
 // Node is a generic interface for all nodes in an AST.
 //
 // Whenever numerous nodes are listed such as in a switch-case statement
@@ -43,7 +45,7 @@ type Node interface {
 	// Pretty returns the prettified representation of the node.
 	// It uses the level information to determine at which level/depth the current
 	// node is in the AST and uses this to apply indentation.
-	Pretty(level int) string
+	Pretty(level int, mode PrettifyMode) string
 
 	// PositionRange returns the position of the AST Node in the query string.
 	PositionRange() posrange.PositionRange
@@ -238,9 +240,9 @@ type VectorSelector struct {
 // of an arbitrary function during handling. It is used to test the Engine.
 type TestStmt func(context.Context) error
 
-func (TestStmt) String() string      { return "test statement" }
-func (TestStmt) PromQLStmt()         {}
-func (t TestStmt) Pretty(int) string { return t.String() }
+func (TestStmt) String() string                    { return "test statement" }
+func (TestStmt) PromQLStmt()                       {}
+func (t TestStmt) Pretty(int, PrettifyMode) string { return t.String() }
 
 func (TestStmt) PositionRange() posrange.PositionRange {
 	return posrange.PositionRange{

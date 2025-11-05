@@ -14,6 +14,7 @@
 package parser
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 )
@@ -43,51 +44,117 @@ import (
 
 var maxCharactersPerLine = 100
 
+type PrettifyMode int
+
+var (
+	PrettifyPromQLMode      PrettifyMode = 0
+	PrettifyPipedPromQLMode PrettifyMode = 2
+)
+
 func Prettify(n Node) string {
-	return n.Pretty(0)
+	return n.Pretty(0, PrettifyPromQLMode)
 }
 
-func (e *AggregateExpr) Pretty(level int) string {
-	s := indent(level)
-	if !needsSplit(e) {
-		s += e.String()
+func PipedPrettify(n Node) string {
+	return n.Pretty(0, PrettifyPipedPromQLMode)
+}
+
+func (e *AggregateExpr) Pretty(level int, mode PrettifyMode) string {
+	switch mode {
+	default:
+		fallthrough
+	case PrettifyPromQLMode:
+		s := indent(level)
+		if !needsSplit(e) {
+			s += e.String()
+			return s
+		}
+
+		s += e.ShortString()
+		s += "(\n"
+
+		if e.Op.IsAggregatorWithParam() {
+			s += fmt.Sprintf("%s,\n", e.Param.Pretty(level+1, mode))
+		}
+		s += fmt.Sprintf("%s\n%s)", e.Expr.Pretty(level+1, mode), indent(level))
 		return s
-	}
+	case PrettifyPipedPromQLMode:
+		b := bytes.NewBuffer(nil)
 
-	s += e.ShortString()
-	s += "(\n"
+		// Render the source expression first (the subject of the pipe).
+		// It will handle its own indentation based on the level.
+		b.WriteString(e.Expr.Pretty(level, mode))
 
-	if e.Op.IsAggregatorWithParam() {
-		s += fmt.Sprintf("%s,\n", e.Param.Pretty(level+1))
+		b.WriteString("\n|> ")
+		b.WriteString(e.Op.String())
+		if e.Op.IsAggregatorWithParam() {
+			b.WriteString("(")
+			b.WriteString(e.Param.Pretty(0, mode))
+			b.WriteString(")")
+		}
+
+		switch {
+		case e.Without:
+			b.WriteString(" without (")
+			writeLabels(b, e.Grouping)
+			b.WriteString(") ")
+		case len(e.Grouping) > 0:
+			b.WriteString(" by (")
+			writeLabels(b, e.Grouping)
+			b.WriteString(") ")
+		}
+		return b.String()
 	}
-	s += fmt.Sprintf("%s\n%s)", e.Expr.Pretty(level+1), indent(level))
-	return s
 }
 
-func (e *BinaryExpr) Pretty(level int) string {
-	s := indent(level)
-	if !needsSplit(e) {
-		s += e.String()
-		return s
-	}
-	returnBool := ""
-	if e.ReturnBool {
-		returnBool = " bool"
-	}
+func (e *BinaryExpr) Pretty(level int, mode PrettifyMode) string {
+	switch mode {
+	default:
+		fallthrough
+	case PrettifyPromQLMode:
+		s := indent(level)
+		if !needsSplit(e) {
+			s += e.String()
+			return s
+		}
+		returnBool := ""
+		if e.ReturnBool {
+			returnBool = " bool"
+		}
 
-	matching := e.getMatchingStr()
-	return fmt.Sprintf("%s\n%s%s%s%s\n%s", e.LHS.Pretty(level+1), indent(level), e.Op, returnBool, matching, e.RHS.Pretty(level+1))
+		matching := e.getMatchingStr()
+		return fmt.Sprintf("%s\n%s%s%s%s\n%s", e.LHS.Pretty(level+1, mode), indent(level), e.Op, returnBool, matching, e.RHS.Pretty(level+1, mode))
+	case PrettifyPipedPromQLMode:
+		b := bytes.NewBuffer(nil)
+
+		b.WriteString(indent(level))
+		b.WriteString(e.LHS.Pretty(level+1, mode))
+
+		b.WriteString("\n")
+		b.WriteString(indent(level))
+		b.WriteString(e.RHS.Pretty(level+1, mode))
+
+		b.WriteString("\n")
+		b.WriteString(indent(level))
+		b.WriteString("| ")
+		b.WriteString(e.Op.String())
+		if e.ReturnBool {
+			b.WriteString(" bool ")
+		}
+		b.WriteString(e.getMatchingStr())
+		return b.String()
+	}
 }
 
-func (e *DurationExpr) Pretty(int) string {
+func (e *DurationExpr) Pretty(_ int, mode PrettifyMode) string {
 	var s string
 	fmt.Println("e.LHS", e.LHS)
 	fmt.Println("e.RHS", e.RHS)
 	if e.LHS == nil {
 		// This is a unary duration expression.
-		s = fmt.Sprintf("%s%s", e.Op, e.RHS.Pretty(0))
+		s = fmt.Sprintf("%s%s", e.Op, e.RHS.Pretty(0, mode))
 	} else {
-		s = fmt.Sprintf("%s %s %s", e.LHS.Pretty(0), e.Op, e.RHS.Pretty(0))
+		s = fmt.Sprintf("%s %s %s", e.LHS.Pretty(0, mode), e.Op, e.RHS.Pretty(0, mode))
 	}
 	if e.Wrapped {
 		s = fmt.Sprintf("(%s)", s)
@@ -95,67 +162,81 @@ func (e *DurationExpr) Pretty(int) string {
 	return s
 }
 
-func (e *Call) Pretty(level int) string {
-	s := indent(level)
-	if !needsSplit(e) {
-		s += e.String()
+func (e *Call) Pretty(level int, mode PrettifyMode) string {
+	switch mode {
+	default:
+		fallthrough
+	case PrettifyPromQLMode:
+		s := indent(level)
+		if !needsSplit(e) {
+			s += e.String()
+			return s
+		}
+		s += fmt.Sprintf("%s(\n%s\n%s)", e.Func.Name, e.Args.Pretty(level+1, mode), indent(level))
 		return s
+	case PrettifyPipedPromQLMode:
+		b := bytes.NewBuffer(nil)
+
+		if len(e.Args) > 0 {
+			b.WriteString(e.Args.Pretty(level+1, mode))
+			b.WriteString(" | ")
+		}
+		b.WriteString(e.Func.Name)
+		return b.String()
 	}
-	s += fmt.Sprintf("%s(\n%s\n%s)", e.Func.Name, e.Args.Pretty(level+1), indent(level))
-	return s
 }
 
-func (e *EvalStmt) Pretty(int) string {
+func (e *EvalStmt) Pretty(int, PrettifyMode) string {
 	return "EVAL " + e.Expr.String()
 }
 
-func (e Expressions) Pretty(level int) string {
+func (e Expressions) Pretty(level int, mode PrettifyMode) string {
 	// Do not prefix the indent since respective nodes will indent itself.
 	s := ""
 	for i := range e {
-		s += fmt.Sprintf("%s,\n", e[i].Pretty(level))
+		s += fmt.Sprintf("%s,\n", e[i].Pretty(level, mode))
 	}
 	return s[:len(s)-2]
 }
 
-func (e *ParenExpr) Pretty(level int) string {
+func (e *ParenExpr) Pretty(level int, mode PrettifyMode) string {
 	s := indent(level)
 	if !needsSplit(e) {
 		s += e.String()
 		return s
 	}
-	return fmt.Sprintf("%s(\n%s\n%s)", s, e.Expr.Pretty(level+1), indent(level))
+	return fmt.Sprintf("%s(\n%s\n%s)", s, e.Expr.Pretty(level+1, mode), indent(level))
 }
 
-func (e *StepInvariantExpr) Pretty(level int) string {
-	return e.Expr.Pretty(level)
+func (e *StepInvariantExpr) Pretty(level int, mode PrettifyMode) string {
+	return e.Expr.Pretty(level, mode)
 }
 
-func (e *MatrixSelector) Pretty(level int) string {
+func (e *MatrixSelector) Pretty(level int, _ PrettifyMode) string {
 	return getCommonPrefixIndent(level, e)
 }
 
-func (e *SubqueryExpr) Pretty(level int) string {
+func (e *SubqueryExpr) Pretty(level int, mode PrettifyMode) string {
 	if !needsSplit(e) {
 		return e.String()
 	}
-	return fmt.Sprintf("%s%s", e.Expr.Pretty(level), e.getSubqueryTimeSuffix())
+	return fmt.Sprintf("%s%s", e.Expr.Pretty(level, mode), e.getSubqueryTimeSuffix())
 }
 
-func (e *VectorSelector) Pretty(level int) string {
+func (e *VectorSelector) Pretty(level int, _ PrettifyMode) string {
 	return getCommonPrefixIndent(level, e)
 }
 
-func (e *NumberLiteral) Pretty(level int) string {
+func (e *NumberLiteral) Pretty(level int, _ PrettifyMode) string {
 	return getCommonPrefixIndent(level, e)
 }
 
-func (e *StringLiteral) Pretty(level int) string {
+func (e *StringLiteral) Pretty(level int, _ PrettifyMode) string {
 	return getCommonPrefixIndent(level, e)
 }
 
-func (e *UnaryExpr) Pretty(level int) string {
-	child := e.Expr.Pretty(level)
+func (e *UnaryExpr) Pretty(level int, mode PrettifyMode) string {
+	child := e.Expr.Pretty(level, mode)
 	// Remove the indent prefix from child since we attach the prefix indent before Op.
 	child = strings.TrimSpace(child)
 	return fmt.Sprintf("%s%s%s", indent(level), e.Op, child)
