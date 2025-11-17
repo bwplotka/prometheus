@@ -120,21 +120,32 @@ func (c *FloatHistogramChunk) Appender() (Appender, error) {
 		}
 	}
 
+	quantileValuesXor := make([]xorValue, len(it.quantileValues))
+	for i := 0; i < len(it.quantileValues); i++ {
+		quantileValuesXor[i] = xorValue{
+			value:    it.quantileValues[i],
+			leading:  it.quantileValuesLeading[i],
+			trailing: it.quantileValuesTrailing[i],
+		}
+	}
+
 	a := &FloatHistogramAppender{
 		b: &c.b,
 
-		schema:       it.schema,
-		zThreshold:   it.zThreshold,
-		pSpans:       it.pSpans,
-		nSpans:       it.nSpans,
-		customValues: it.customValues,
-		t:            it.t,
-		tDelta:       it.tDelta,
-		cnt:          it.cnt,
-		zCnt:         it.zCnt,
-		pBuckets:     pBuckets,
-		nBuckets:     nBuckets,
-		sum:          it.sum,
+		schema:            it.schema,
+		zThreshold:        it.zThreshold,
+		pSpans:            it.pSpans,
+		nSpans:            it.nSpans,
+		customValues:      it.customValues,
+		quantileTargets:   it.quantileTargets,
+		quantileValuesXor: quantileValuesXor,
+		t:                 it.t,
+		tDelta:            it.tDelta,
+		cnt:               it.cnt,
+		zCnt:              it.zCnt,
+		pBuckets:          pBuckets,
+		nBuckets:          nBuckets,
+		sum:               it.sum,
 	}
 	return a, nil
 }
@@ -182,6 +193,8 @@ type FloatHistogramAppender struct {
 	t, tDelta          int64
 	sum, cnt, zCnt     xorValue
 	pBuckets, nBuckets []xorValue
+
+	quantileValuesXor []xorValue
 }
 
 func (a *FloatHistogramAppender) GetCounterResetHeader() CounterResetHeader {
@@ -591,6 +604,18 @@ func (a *FloatHistogramAppender) appendFloatHistogram(t int64, h *histogram.Floa
 			a.nBuckets = nil
 		}
 
+		if len(h.QuantileValues) > 0 {
+			a.quantileValuesXor = make([]xorValue, len(h.QuantileValues))
+			for i := range len(h.QuantileValues) {
+				a.quantileValuesXor[i] = xorValue{
+					value:   h.QuantileValues[i],
+					leading: 0xff,
+				}
+			}
+		} else {
+			a.quantileValuesXor = nil
+		}
+
 		// Now store the actual data.
 		putVarbitInt(a.b, t)
 		a.b.writeBits(math.Float64bits(h.Count), 64)
@@ -604,6 +629,9 @@ func (a *FloatHistogramAppender) appendFloatHistogram(t int64, h *histogram.Floa
 		}
 		for _, b := range h.NegativeBuckets {
 			a.b.writeBits(math.Float64bits(b), 64)
+		}
+		for _, q := range h.QuantileValues {
+			a.b.writeBits(math.Float64bits(q), 64)
 		}
 	} else {
 		// The case for the 2nd sample with single deltas is implicitly handled correctly with the double delta code,
@@ -621,6 +649,9 @@ func (a *FloatHistogramAppender) appendFloatHistogram(t int64, h *histogram.Floa
 		}
 		for i, b := range h.NegativeBuckets {
 			a.writeXorValue(&a.nBuckets[i], b)
+		}
+		for i, b := range h.QuantileValues {
+			a.writeXorValue(&a.quantileValuesXor[i], b)
 		}
 	}
 
@@ -856,6 +887,8 @@ type floatHistogramIterator struct {
 	pBucketsLeading, nBucketsLeading   []uint8
 	pBucketsTrailing, nBucketsTrailing []uint8
 
+	quantileValuesLeading, quantileValuesTrailing []uint8
+
 	err error
 
 	// Track calls to retrieve methods. Once they have been called, we
@@ -983,6 +1016,7 @@ func (it *floatHistogramIterator) Reset(b []byte) {
 	}
 	it.pBucketsLeading, it.pBucketsTrailing = it.pBucketsLeading[:0], it.pBucketsTrailing[:0]
 	it.nBucketsLeading, it.nBucketsTrailing = it.nBucketsLeading[:0], it.nBucketsTrailing[:0]
+	it.quantileValuesLeading, it.quantileValuesTrailing = it.quantileValuesLeading[:0], it.quantileValuesTrailing[:0]
 
 	it.err = nil
 }
@@ -996,7 +1030,7 @@ func (it *floatHistogramIterator) Next() ValueType {
 		// The first read is responsible for reading the chunk layout
 		// and for initializing fields that depend on it. We give
 		// counter reset info at chunk level, hence we discard it here.
-		schema, zeroThreshold, posSpans, negSpans, customValues, quantileTargets, quantileValues, err := readHistogramChunkLayout(&it.br)
+		schema, zeroThreshold, posSpans, negSpans, customValues, quantileTargets, err := readHistogramChunkLayout(&it.br)
 		if err != nil {
 			it.err = err
 			return ValNone
@@ -1011,7 +1045,9 @@ func (it *floatHistogramIterator) Next() ValueType {
 		it.zThreshold = zeroThreshold
 		it.pSpans, it.nSpans = posSpans, negSpans
 		it.customValues = customValues
+		it.quantileTargets = quantileTargets
 		numPBuckets, numNBuckets := countSpans(posSpans), countSpans(negSpans)
+		numQuantiles := len(quantileTargets)
 		// Allocate bucket slices as needed, recycling existing slices
 		// in case this iterator was reset and already has slices of a
 		// sufficient capacity.
@@ -1024,6 +1060,11 @@ func (it *floatHistogramIterator) Next() ValueType {
 			it.nBuckets = append(it.nBuckets, make([]float64, numNBuckets)...)
 			it.nBucketsLeading = append(it.nBucketsLeading, make([]uint8, numNBuckets)...)
 			it.nBucketsTrailing = append(it.nBucketsTrailing, make([]uint8, numNBuckets)...)
+		}
+		if numQuantiles > 0 {
+			it.quantileValues = append(it.quantileValues, make([]float64, numQuantiles)...)
+			it.quantileValuesLeading = append(it.quantileValuesLeading, make([]uint8, numQuantiles)...)
+			it.quantileValuesTrailing = append(it.quantileValuesTrailing, make([]uint8, numQuantiles)...)
 		}
 
 		// Now read the actual data.
@@ -1070,6 +1111,15 @@ func (it *floatHistogramIterator) Next() ValueType {
 				return ValNone
 			}
 			it.nBuckets[i] = math.Float64frombits(v)
+		}
+
+		for i := range it.quantileValues {
+			v, err := it.br.readBits(64)
+			if err != nil {
+				it.err = err
+				return ValNone
+			}
+			it.quantileValues[i] = math.Float64frombits(v)
 		}
 
 		it.numRead++
@@ -1119,6 +1169,14 @@ func (it *floatHistogramIterator) Next() ValueType {
 		} else {
 			it.customValues = nil
 		}
+
+		if len(it.quantileTargets) > 0 {
+			newQuantileTargets := make([]float64, len(it.quantileTargets))
+			copy(newQuantileTargets, it.quantileTargets)
+			it.quantileTargets = newQuantileTargets
+		} else {
+			it.quantileTargets = nil
+		}
 	}
 
 	tDod, err := readVarbitInt(&it.br)
@@ -1154,6 +1212,12 @@ func (it *floatHistogramIterator) Next() ValueType {
 
 	for i := range it.nBuckets {
 		if ok := it.readXor(&it.nBuckets[i], &it.nBucketsLeading[i], &it.nBucketsTrailing[i]); !ok {
+			return ValNone
+		}
+	}
+
+	for i := range it.quantileValues {
+		if ok := it.readXor(&it.quantileValues[i], &it.quantileValuesLeading[i], &it.quantileValuesTrailing[i]); !ok {
 			return ValNone
 		}
 	}

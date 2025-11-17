@@ -520,7 +520,7 @@ func TestWriteReadHistogramChunkLayout(t *testing.T) {
 	bsr := newBReader(bs.bytes())
 
 	for _, want := range layouts {
-		gotSchema, gotZeroThreshold, gotPositiveSpans, gotNegativeSpans, gotCustomBounds, gotQuantileTarget, quantileValues, err := readHistogramChunkLayout(&bsr)
+		gotSchema, gotZeroThreshold, gotPositiveSpans, gotNegativeSpans, gotCustomBounds, gotQuantileTarget, err := readHistogramChunkLayout(&bsr)
 		require.NoError(t, err)
 		require.Equal(t, want.schema, gotSchema)
 		require.Equal(t, want.zeroThreshold, gotZeroThreshold)
@@ -528,7 +528,6 @@ func TestWriteReadHistogramChunkLayout(t *testing.T) {
 		require.Equal(t, want.negativeSpans, gotNegativeSpans)
 		require.Equal(t, want.customValues, gotCustomBounds)
 		require.Equal(t, want.quantileTargets, gotQuantileTarget)
-		require.Equal(t, want.quantileValues, quantileValues)
 	}
 }
 

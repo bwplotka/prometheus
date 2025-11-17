@@ -559,7 +559,8 @@ func (a *HistogramAppender) appendHistogram(t int64, h *histogram.Histogram) {
 	if num == 0 {
 		// The first append gets the privilege to dictate the layout
 		// but it's also responsible for encoding it into the chunk!
-		writeHistogramChunkLayout(a.b, h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans, h.CustomValues)
+		// No native summaries in integer histograms.
+		writeHistogramChunkLayout(a.b, h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans, h.CustomValues, nil, nil)
 		a.schema = h.Schema
 		a.zThreshold = h.ZeroThreshold
 
@@ -1102,7 +1103,8 @@ func (it *histogramIterator) Next() ValueType {
 		// The first read is responsible for reading the chunk layout
 		// and for initializing fields that depend on it. We give
 		// counter reset info at chunk level, hence we discard it here.
-		schema, zeroThreshold, posSpans, negSpans, customValues, quantileTargets, quantileValues, err := readHistogramChunkLayout(&it.br)
+		// No native summaries in integer histograms.
+		schema, zeroThreshold, posSpans, negSpans, customValues, _, err := readHistogramChunkLayout(&it.br)
 		if err != nil {
 			it.err = err
 			return ValNone

@@ -33,54 +33,49 @@ func writeHistogramChunkLayout(
 	}
 	if histogram.IsNativeSummarySchema(schema) {
 		putHistogramChunkLayoutQuantileTargets(b, quantileTargets)
-		putHistogramChunkLayoutQuantileValues(b, quantileValues)
 	}
 }
 
 func readHistogramChunkLayout(b *bstreamReader) (
 	schema int32, zeroThreshold float64,
 	positiveSpans, negativeSpans []histogram.Span,
-	customValues, quantileTargets, quantileValues []float64,
+	customValues, quantileTargets []float64,
 	err error,
 ) {
 	zeroThreshold, err = readZeroThreshold(b)
 	if err != nil {
-		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, err
 	}
 
 	v, err := readVarbitInt(b)
 	if err != nil {
-		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, err
 	}
 	schema = int32(v)
 
 	positiveSpans, err = readHistogramChunkLayoutSpans(b)
 	if err != nil {
-		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, err
 	}
 
 	negativeSpans, err = readHistogramChunkLayoutSpans(b)
 	if err != nil {
-		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, err
 	}
 
 	if histogram.IsCustomBucketsSchema(schema) {
 		customValues, err = readHistogramChunkLayoutCustomBounds(b)
 		if err != nil {
-			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, err
 		}
 	}
 	if histogram.IsNativeSummarySchema(schema) {
 		quantileTargets, err = readHistogramChunkLayoutQuantileTargets(b)
 		if err != nil {
-			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
-		}
-		quantileValues, err = readHistogramChunkLayoutQuantileValues(b)
-		if err != nil {
-			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, err
 		}
 	}
-	return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+	return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, err
 }
 
 func putHistogramChunkLayoutSpans(b *bstream, spans []histogram.Span) {
@@ -161,30 +156,6 @@ func putHistogramChunkLayoutQuantileTargets(b *bstream, quantileTargets []float6
 	putVarbitUint(b, uint64(len(quantileTargets)))
 	for _, target := range quantileTargets {
 		putQuantileTarget(b, target)
-	}
-}
-
-func readHistogramChunkLayoutQuantileValues(b *bstreamReader) ([]float64, error) {
-	var quantileValues []float64
-	num, err := readVarbitUint(b)
-	if err != nil {
-		return nil, err
-	}
-	for i := 0; i < int(num); i++ {
-		value, err := readQuantileValue(b)
-		if err != nil {
-			return nil, err
-		}
-
-		quantileValues = append(quantileValues, value)
-	}
-	return quantileValues, nil
-}
-
-func putHistogramChunkLayoutQuantileValues(b *bstream, quantileValue []float64) {
-	putVarbitUint(b, uint64(len(quantileValue)))
-	for _, value := range quantileValue {
-		putQuantileValue(b, value)
 	}
 }
 
