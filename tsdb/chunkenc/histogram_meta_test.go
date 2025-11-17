@@ -431,10 +431,11 @@ func TestExpandSpansBothWaysAndInsert(t *testing.T) {
 
 func TestWriteReadHistogramChunkLayout(t *testing.T) {
 	layouts := []struct {
-		schema                       int32
-		zeroThreshold                float64
-		positiveSpans, negativeSpans []histogram.Span
-		customValues                 []float64
+		schema                          int32
+		zeroThreshold                   float64
+		positiveSpans, negativeSpans    []histogram.Span
+		customValues                    []float64
+		quantileTargets, quantileValues []float64
 	}{
 		{
 			schema:        3,
@@ -513,19 +514,21 @@ func TestWriteReadHistogramChunkLayout(t *testing.T) {
 	bs := bstream{}
 
 	for _, l := range layouts {
-		writeHistogramChunkLayout(&bs, l.schema, l.zeroThreshold, l.positiveSpans, l.negativeSpans, l.customValues)
+		writeHistogramChunkLayout(&bs, l.schema, l.zeroThreshold, l.positiveSpans, l.negativeSpans, l.customValues, l.quantileTargets, l.quantileValues)
 	}
 
 	bsr := newBReader(bs.bytes())
 
 	for _, want := range layouts {
-		gotSchema, gotZeroThreshold, gotPositiveSpans, gotNegativeSpans, gotCustomBounds, err := readHistogramChunkLayout(&bsr)
+		gotSchema, gotZeroThreshold, gotPositiveSpans, gotNegativeSpans, gotCustomBounds, gotQuantileTarget, quantileValues, err := readHistogramChunkLayout(&bsr)
 		require.NoError(t, err)
 		require.Equal(t, want.schema, gotSchema)
 		require.Equal(t, want.zeroThreshold, gotZeroThreshold)
 		require.Equal(t, want.positiveSpans, gotPositiveSpans)
 		require.Equal(t, want.negativeSpans, gotNegativeSpans)
 		require.Equal(t, want.customValues, gotCustomBounds)
+		require.Equal(t, want.quantileTargets, gotQuantileTarget)
+		require.Equal(t, want.quantileValues, quantileValues)
 	}
 }
 

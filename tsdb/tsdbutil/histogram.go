@@ -153,6 +153,27 @@ func GenerateTestCustomBucketsFloatHistogram(i int64) *histogram.FloatHistogram 
 	}
 }
 
+func GenerateTestNativeSummaries(n int) (r []*histogram.FloatHistogram) {
+	for i := range n {
+		h := GenerateTestNativeSummary(int64(i))
+		if i > 0 {
+			h.CounterResetHint = histogram.NotCounterReset
+		}
+		r = append(r, h)
+	}
+	return r
+}
+
+func GenerateTestNativeSummary(i int64) *histogram.FloatHistogram {
+	return &histogram.FloatHistogram{
+		Count:           5 + float64(i*4),
+		Sum:             18.4 * float64(i+1),
+		Schema:          histogram.NativeSummarySchema,
+		QuantileTargets: []float64{0.5, 0.75, 0.95, 0.99, 0.999},
+		QuantileValues:  []float64{float64(i + 1), float64(i + 2), float64(i + 3), float64(i + 4), float64(i + 5)},
+	}
+}
+
 func GenerateTestGaugeFloatHistograms(n int) (r []*histogram.FloatHistogram) {
 	for x := range n {
 		i := int64(math.Sin(float64(x))*100) + 100

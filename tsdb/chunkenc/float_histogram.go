@@ -176,6 +176,9 @@ type FloatHistogramAppender struct {
 	pSpans, nSpans []histogram.Span
 	customValues   []float64
 
+	quantileValues  []float64
+	quantileTargets []float64
+
 	t, tDelta          int64
 	sum, cnt, zCnt     xorValue
 	pBuckets, nBuckets []xorValue
@@ -263,6 +266,10 @@ func (a *FloatHistogramAppender) appendable(h *histogram.FloatHistogram) (
 		return positiveInserts, negativeInserts, backwardPositiveInserts, backwardNegativeInserts, okToAppend, counterReset
 	}
 
+	if histogram.IsNativeSummarySchema(h.Schema) && !histogram.NativeSummariesMatch(h.QuantileTargets, a.quantileTargets, h.QuantileValues, a.quantileValues) {
+		counterReset = true
+		return positiveInserts, negativeInserts, backwardPositiveInserts, backwardNegativeInserts, okToAppend, counterReset
+	}
 	if h.ZeroCount < a.zCnt.value {
 		// There has been a counter reset since ZeroThreshold didn't change.
 		counterReset = true
@@ -522,9 +529,24 @@ func (a *FloatHistogramAppender) appendFloatHistogram(t int64, h *histogram.Floa
 	if num == 0 {
 		// The first append gets the privilege to dictate the layout
 		// but it's also responsible for encoding it into the chunk!
-		writeHistogramChunkLayout(a.b, h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans, h.CustomValues)
+		writeHistogramChunkLayout(a.b, h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans, h.CustomValues, h.QuantileTargets, h.QuantileValues)
 		a.schema = h.Schema
 		a.zThreshold = h.ZeroThreshold
+
+		// TODO(Naman): Kindly investigate
+		if len(h.QuantileTargets) > 0 {
+			a.quantileTargets = make([]float64, len(h.QuantileTargets))
+			copy(a.quantileTargets, h.QuantileTargets)
+		} else {
+			a.quantileTargets = nil
+		}
+
+		if len(h.QuantileValues) > 0 {
+			a.quantileValues = make([]float64, len(h.QuantileValues))
+			copy(a.quantileValues, h.QuantileValues)
+		} else {
+			a.quantileValues = nil
+		}
 
 		if len(h.PositiveSpans) > 0 {
 			a.pSpans = make([]histogram.Span, len(h.PositiveSpans))
@@ -818,6 +840,9 @@ type floatHistogramIterator struct {
 	pSpans, nSpans []histogram.Span
 	customValues   []float64
 
+	quantileTargets []float64
+	quantileValues  []float64
+
 	// For the fields that are tracked as deltas and ultimately dod's.
 	t      int64
 	tDelta int64
@@ -878,6 +903,8 @@ func (it *floatHistogramIterator) AtFloatHistogram(fh *histogram.FloatHistogram)
 			PositiveBuckets:  it.pBuckets,
 			NegativeBuckets:  it.nBuckets,
 			CustomValues:     it.customValues,
+			QuantileTargets:  it.quantileTargets,
+			QuantileValues:   it.quantileValues,
 		}
 		if fh.Schema > histogram.ExponentialSchemaMax && fh.Schema <= histogram.ExponentialSchemaMaxReserved {
 			// This is a very slow path, but it should only happen if the
@@ -910,6 +937,9 @@ func (it *floatHistogramIterator) AtFloatHistogram(fh *histogram.FloatHistogram)
 
 	// Custom values are interned. The single copy is in this iterator.
 	fh.CustomValues = it.customValues
+
+	fh.QuantileTargets = it.quantileTargets
+	fh.QuantileValues = it.quantileValues
 
 	if fh.Schema > histogram.ExponentialSchemaMax && fh.Schema <= histogram.ExponentialSchemaMaxReserved {
 		// This is a very slow path, but it should only happen if the
@@ -946,6 +976,8 @@ func (it *floatHistogramIterator) Reset(b []byte) {
 		it.pBuckets, it.nBuckets = nil, nil
 		it.pSpans, it.nSpans = nil, nil
 		it.customValues = nil
+		it.quantileTargets = nil
+		it.quantileValues = nil
 	} else {
 		it.pBuckets, it.nBuckets = it.pBuckets[:0], it.nBuckets[:0]
 	}
@@ -964,7 +996,7 @@ func (it *floatHistogramIterator) Next() ValueType {
 		// The first read is responsible for reading the chunk layout
 		// and for initializing fields that depend on it. We give
 		// counter reset info at chunk level, hence we discard it here.
-		schema, zeroThreshold, posSpans, negSpans, customValues, err := readHistogramChunkLayout(&it.br)
+		schema, zeroThreshold, posSpans, negSpans, customValues, quantileTargets, quantileValues, err := readHistogramChunkLayout(&it.br)
 		if err != nil {
 			it.err = err
 			return ValNone

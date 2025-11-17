@@ -26,6 +26,7 @@ const (
 	ExponentialSchemaMin         int32 = -4
 	ExponentialSchemaMinReserved int32 = -9
 	CustomBucketsSchema          int32 = -53
+	NativeSummarySchema          int32 = -66
 )
 
 type Error struct {
@@ -69,6 +70,10 @@ func IsCustomBucketsSchema(s int32) bool {
 	return s == CustomBucketsSchema
 }
 
+func IsNativeSummarySchema(s int32) bool {
+	return s == NativeSummarySchema
+}
+
 func IsExponentialSchema(s int32) bool {
 	return s >= ExponentialSchemaMin && s <= ExponentialSchemaMax
 }
@@ -84,7 +89,7 @@ func IsValidSchema(s int32) bool {
 // IsKnownSchema returns bool if we known and accept the schema, but need to
 // reduce resolution to the nearest supported schema.
 func IsKnownSchema(s int32) bool {
-	return IsCustomBucketsSchema(s) || IsExponentialSchemaReserved(s)
+	return IsCustomBucketsSchema(s) || IsExponentialSchemaReserved(s) || IsNativeSummarySchema(s)
 }
 
 // CustomBucketBoundsMatch compares histogram custom bucket bounds (CustomValues)
@@ -98,6 +103,24 @@ func CustomBucketBoundsMatch(c1, c2 []float64) bool {
 			return false
 		}
 	}
+	return true
+}
+
+// NativeSummariesMatch comparies native summaries stored in native histogram structure
+// and returns true if all values match
+func NativeSummariesMatch(quantileTarget1, quantileTarget2, quantileValue1, quantileValue2 []float64) bool {
+	if len(quantileTarget1) != len(quantileTarget2) || len(quantileTarget1) != len(quantileValue1) || len(quantileTarget2) != len(quantileValue2) || len(quantileValue1) != len(quantileValue2) {
+		return false
+	}
+	for i, c := range quantileTarget1 {
+		if c != quantileTarget2[i] {
+			return false
+		}
+		if quantileValue1[i] != quantileValue2[i] {
+			return false
+		}
+	}
+
 	return true
 }
 

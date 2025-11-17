@@ -57,10 +57,18 @@ type FloatHistogram struct {
 	// schema is for custom buckets, and the ZeroThreshold, ZeroCount, NegativeSpans
 	// and NegativeBuckets fields are not used in that case.
 	CustomValues []float64
+
+	QuantileTargets []float64
+
+	QuantileValues []float64
 }
 
 func (h *FloatHistogram) UsesCustomBuckets() bool {
 	return IsCustomBucketsSchema(h.Schema)
+}
+
+func (h *FloatHistogram) UsesNativeSummary() bool {
+	return IsNativeSummarySchema(h.Schema)
 }
 
 // Copy returns a deep copy of the Histogram.
@@ -75,6 +83,9 @@ func (h *FloatHistogram) Copy() *FloatHistogram {
 	if h.UsesCustomBuckets() {
 		// Custom values are interned, so no need to copy them.
 		c.CustomValues = h.CustomValues
+	} else if h.UsesNativeSummary() {
+		c.QuantileTargets = h.QuantileTargets
+		c.QuantileValues = h.QuantileValues
 	} else {
 		c.ZeroThreshold = h.ZeroThreshold
 		c.ZeroCount = h.ZeroCount
@@ -152,6 +163,12 @@ func (h *FloatHistogram) CopyToSchema(targetSchema int32) *FloatHistogram {
 	}
 	if IsCustomBucketsSchema(targetSchema) {
 		panic("cannot reduce resolution to custom buckets schema")
+	}
+	if h.UsesNativeSummary() {
+		panic(fmt.Errorf("cannot reduce resolution to %d when there is native summary", targetSchema))
+	}
+	if IsNativeSummarySchema(targetSchema) {
+		panic("cannot reduce resolution to native summary")
 	}
 	if targetSchema > h.Schema {
 		panic(fmt.Errorf("cannot copy from schema %d to %d", h.Schema, targetSchema))
@@ -264,10 +281,13 @@ func (h *FloatHistogram) TestExpression() string {
 	return "{{" + strings.Join(res, " ") + "}}"
 }
 
-// ZeroBucket returns the zero bucket. This method panics if the schema is for custom buckets.
+// ZeroBucket returns the zero bucket. This method panics if the schema is for custom buckets or native summary.
 func (h *FloatHistogram) ZeroBucket() Bucket[float64] {
 	if h.UsesCustomBuckets() {
 		panic("histograms with custom buckets have no zero bucket")
+	}
+	if h.UsesNativeSummary() {
+		panic("histograms with native summaries have no zero bucket")
 	}
 	return Bucket[float64]{
 		Lower:          -h.ZeroThreshold,
@@ -495,6 +515,12 @@ func (h *FloatHistogram) Equals(h2 *FloatHistogram) bool {
 
 	if h.UsesCustomBuckets() {
 		if !CustomBucketBoundsMatch(h.CustomValues, h2.CustomValues) {
+			return false
+		}
+	}
+
+	if h.UsesNativeSummary() {
+		if !NativeSummariesMatch(h.QuantileTargets, h2.QuantileTargets, h.QuantileValues, h2.QuantileValues) {
 			return false
 		}
 	}

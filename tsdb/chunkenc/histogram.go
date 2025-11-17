@@ -1102,7 +1102,7 @@ func (it *histogramIterator) Next() ValueType {
 		// The first read is responsible for reading the chunk layout
 		// and for initializing fields that depend on it. We give
 		// counter reset info at chunk level, hence we discard it here.
-		schema, zeroThreshold, posSpans, negSpans, customValues, err := readHistogramChunkLayout(&it.br)
+		schema, zeroThreshold, posSpans, negSpans, customValues, quantileTargets, quantileValues, err := readHistogramChunkLayout(&it.br)
 		if err != nil {
 			it.err = err
 			return ValNone

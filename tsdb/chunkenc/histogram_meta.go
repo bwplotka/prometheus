@@ -22,6 +22,7 @@ import (
 func writeHistogramChunkLayout(
 	b *bstream, schema int32, zeroThreshold float64,
 	positiveSpans, negativeSpans []histogram.Span, customValues []float64,
+	quantileTargets, quantileValues []float64,
 ) {
 	putZeroThreshold(b, zeroThreshold)
 	putVarbitInt(b, int64(schema))
@@ -30,43 +31,56 @@ func writeHistogramChunkLayout(
 	if histogram.IsCustomBucketsSchema(schema) {
 		putHistogramChunkLayoutCustomBounds(b, customValues)
 	}
+	if histogram.IsNativeSummarySchema(schema) {
+		putHistogramChunkLayoutQuantileTargets(b, quantileTargets)
+		putHistogramChunkLayoutQuantileValues(b, quantileValues)
+	}
 }
 
 func readHistogramChunkLayout(b *bstreamReader) (
 	schema int32, zeroThreshold float64,
 	positiveSpans, negativeSpans []histogram.Span,
-	customValues []float64,
+	customValues, quantileTargets, quantileValues []float64,
 	err error,
 ) {
 	zeroThreshold, err = readZeroThreshold(b)
 	if err != nil {
-		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, err
+		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
 	}
 
 	v, err := readVarbitInt(b)
 	if err != nil {
-		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, err
+		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
 	}
 	schema = int32(v)
 
 	positiveSpans, err = readHistogramChunkLayoutSpans(b)
 	if err != nil {
-		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, err
+		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
 	}
 
 	negativeSpans, err = readHistogramChunkLayoutSpans(b)
 	if err != nil {
-		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, err
+		return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
 	}
 
 	if histogram.IsCustomBucketsSchema(schema) {
 		customValues, err = readHistogramChunkLayoutCustomBounds(b)
 		if err != nil {
-			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, err
+			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
 		}
 	}
-
-	return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, err
+	if histogram.IsNativeSummarySchema(schema) {
+		quantileTargets, err = readHistogramChunkLayoutQuantileTargets(b)
+		if err != nil {
+			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+		}
+		quantileValues, err = readHistogramChunkLayoutQuantileValues(b)
+		if err != nil {
+			return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
+		}
+	}
+	return schema, zeroThreshold, positiveSpans, negativeSpans, customValues, quantileTargets, quantileValues, err
 }
 
 func putHistogramChunkLayoutSpans(b *bstream, spans []histogram.Span) {
@@ -124,6 +138,54 @@ func readHistogramChunkLayoutCustomBounds(b *bstreamReader) ([]float64, error) {
 		customValues = append(customValues, bound)
 	}
 	return customValues, nil
+}
+
+func readHistogramChunkLayoutQuantileTargets(b *bstreamReader) ([]float64, error) {
+	var quantileTargets []float64
+	num, err := readVarbitUint(b)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < int(num); i++ {
+		target, err := readQuantileTarget(b)
+		if err != nil {
+			return nil, err
+		}
+
+		quantileTargets = append(quantileTargets, target)
+	}
+	return quantileTargets, nil
+}
+
+func putHistogramChunkLayoutQuantileTargets(b *bstream, quantileTargets []float64) {
+	putVarbitUint(b, uint64(len(quantileTargets)))
+	for _, target := range quantileTargets {
+		putQuantileTarget(b, target)
+	}
+}
+
+func readHistogramChunkLayoutQuantileValues(b *bstreamReader) ([]float64, error) {
+	var quantileValues []float64
+	num, err := readVarbitUint(b)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < int(num); i++ {
+		value, err := readQuantileValue(b)
+		if err != nil {
+			return nil, err
+		}
+
+		quantileValues = append(quantileValues, value)
+	}
+	return quantileValues, nil
+}
+
+func putHistogramChunkLayoutQuantileValues(b *bstream, quantileValue []float64) {
+	putVarbitUint(b, uint64(len(quantileValue)))
+	for _, value := range quantileValue {
+		putQuantileValue(b, value)
+	}
 }
 
 // putZeroThreshold writes the zero threshold to the bstream. It stores typical
@@ -211,6 +273,64 @@ func putCustomBound(b *bstream, f float64) {
 
 // readCustomBound reads the custom bound written with putCustomBound.
 func readCustomBound(br *bstreamReader) (float64, error) {
+	b, err := readVarbitUint(br)
+	if err != nil {
+		return 0, err
+	}
+	switch b {
+	case 0:
+		v, err := br.readBits(64)
+		if err != nil {
+			return 0, err
+		}
+		return math.Float64frombits(v), nil
+	default:
+		return float64(b-1) / 1000, nil
+	}
+}
+
+func putQuantileTarget(b *bstream, f float64) {
+	tf := f * 1000
+	// 33554431-1 comes from the maximum that can be stored in a varbit in 4
+	// bytes, other values are stored in 8 bytes anyway.
+	if tf < 0 || tf > 33554430 || !isWholeWhenMultiplied(f) {
+		b.writeBit(zero)
+		b.writeBits(math.Float64bits(f), 64)
+		return
+	}
+	putVarbitUint(b, uint64(math.Round(tf))+1)
+}
+
+func readQuantileTarget(br *bstreamReader) (float64, error) {
+	b, err := readVarbitUint(br)
+	if err != nil {
+		return 0, err
+	}
+	switch b {
+	case 0:
+		v, err := br.readBits(64)
+		if err != nil {
+			return 0, err
+		}
+		return math.Float64frombits(v), nil
+	default:
+		return float64(b-1) / 1000, nil
+	}
+}
+
+func putQuantileValue(b *bstream, f float64) {
+	tf := f * 1000
+	// 33554431-1 comes from the maximum that can be stored in a varbit in 4
+	// bytes, other values are stored in 8 bytes anyway.
+	if tf < 0 || tf > 33554430 || !isWholeWhenMultiplied(f) {
+		b.writeBit(zero)
+		b.writeBits(math.Float64bits(f), 64)
+		return
+	}
+	putVarbitUint(b, uint64(math.Round(tf))+1)
+}
+
+func readQuantileValue(br *bstreamReader) (float64, error) {
 	b, err := readVarbitUint(br)
 	if err != nil {
 		return 0, err

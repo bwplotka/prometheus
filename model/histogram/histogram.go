@@ -76,6 +76,10 @@ type Histogram struct {
 	// schema is for custom buckets, and the ZeroThreshold, ZeroCount, NegativeSpans
 	// and NegativeBuckets fields are not used in that case.
 	CustomValues []float64
+
+	QuantileTargets []float64
+
+	QuantileValues []float64
 }
 
 // A Span defines a continuous sequence of buckets.
