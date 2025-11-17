@@ -520,7 +520,7 @@ func (h *FloatHistogram) Equals(h2 *FloatHistogram) bool {
 	}
 
 	if h.UsesNativeSummary() {
-		if !NativeSummariesMatch(h.QuantileTargets, h2.QuantileTargets, h.QuantileValues, h2.QuantileValues) {
+		if !NativeSummariesMatch(h.QuantileTargets, h2.QuantileTargets) {
 			return false
 		}
 	}

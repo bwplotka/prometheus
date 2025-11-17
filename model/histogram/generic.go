@@ -108,15 +108,12 @@ func CustomBucketBoundsMatch(c1, c2 []float64) bool {
 
 // NativeSummariesMatch comparies native summaries stored in native histogram structure
 // and returns true if all values match
-func NativeSummariesMatch(quantileTarget1, quantileTarget2, quantileValue1, quantileValue2 []float64) bool {
-	if len(quantileTarget1) != len(quantileTarget2) || len(quantileTarget1) != len(quantileValue1) || len(quantileTarget2) != len(quantileValue2) || len(quantileValue1) != len(quantileValue2) {
+func NativeSummariesMatch(quantileTarget1, quantileTarget2 []float64) bool {
+	if len(quantileTarget1) != len(quantileTarget2) {
 		return false
 	}
 	for i, c := range quantileTarget1 {
 		if c != quantileTarget2[i] {
-			return false
-		}
-		if quantileValue1[i] != quantileValue2[i] {
 			return false
 		}
 	}

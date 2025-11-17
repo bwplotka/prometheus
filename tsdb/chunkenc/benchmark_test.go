@@ -1,18 +1,16 @@
 package chunkenc
 
 import (
-	"math/rand"
 	"testing"
-	"time"
 
 	"github.com/prometheus/prometheus/model/histogram"
-	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/stretchr/testify/require"
 )
 
 type sampleCase struct {
 	name string
-	h    histogram.Histogram
+	h    []*histogram.FloatHistogram
 }
 
 type fmtCase struct {
@@ -23,16 +21,27 @@ type fmtCase struct {
 func foreachFmtSampleCase(b *testing.B, fn func(b *testing.B, f fmtCase, s sampleCase)) {
 	const nSamples = 120
 
-	d, err := time.Parse(time.DateTime, "2025-11-04 10:01:05")
-	require.NoError(b, err)
+	sampleCases := []sampleCase{
+		{
+			name: "NativeSummary",
+			h:    tsdbutil.GenerateTestNativeSummaries(nSamples),
+		},
+	}
 
-	var (
-		r      = rand.New(rand.NewSource(1))
-		initST = timestamp.FromTime(d) // Use realistic timestamp.
-		initV  = 1243535.123
-	)
+	fmtCases := []fmtCase{
+		{
+			name:       "FloatHistogram",
+			newChunkFn: func() Chunk { return NewFloatHistogramChunk() },
+		},
+	}
 
-	sampleCases := []sampleCase{}
+	for _, f := range fmtCases {
+		for _, s := range sampleCases {
+			b.Run(f.name+"/"+s.name, func(b *testing.B) {
+				fn(b, f, s)
+			})
+		}
+	}
 }
 
 func BenchmarkAppender(b *testing.B) {
@@ -41,6 +50,25 @@ func BenchmarkAppender(b *testing.B) {
 
 		for b.Loop() {
 			c := f.newChunkFn()
+
+			a, err := c.Appender()
+			if err != nil {
+				b.Fatalf("get appender: %s", err)
+			}
+			for j, h := range s.h {
+				newChunk, _, newApp, err := a.AppendFloatHistogram(nil, int64(j*10000), h, false)
+				if err != nil {
+					b.Fatalf("append sample %d: %s", j, err)
+				}
+				if newChunk != nil {
+					b.Logf("New chunk created at sample %d, old chunk has %d samples", j, c.NumSamples())
+					c = newChunk
+				}
+				a = newApp
+			}
+			b.ReportMetric(float64(len(c.Bytes())), "B/chunk")
+
+			require.Equal(b, len(s.h), c.NumSamples())
 		}
 	})
 }

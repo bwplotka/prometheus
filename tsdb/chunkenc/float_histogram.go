@@ -279,7 +279,7 @@ func (a *FloatHistogramAppender) appendable(h *histogram.FloatHistogram) (
 		return positiveInserts, negativeInserts, backwardPositiveInserts, backwardNegativeInserts, okToAppend, counterReset
 	}
 
-	if histogram.IsNativeSummarySchema(h.Schema) && !histogram.NativeSummariesMatch(h.QuantileTargets, a.quantileTargets, h.QuantileValues, a.quantileValues) {
+	if histogram.IsNativeSummarySchema(h.Schema) && !histogram.NativeSummariesMatch(h.QuantileTargets, a.quantileTargets) {
 		counterReset = true
 		return positiveInserts, negativeInserts, backwardPositiveInserts, backwardNegativeInserts, okToAppend, counterReset
 	}
