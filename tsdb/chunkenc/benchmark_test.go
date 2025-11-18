@@ -121,13 +121,14 @@ func generateRandomValueSummaries(n, numQuantiles int) []*histogram.FloatHistogr
 	}
 
 	rs := make([]*histogram.FloatHistogram, n)
+	// this is for base val
 	val := 100.0
 	for i := 0; i < n; i++ {
 		values := make([]float64, numQuantiles)
 		for j := 0; j < numQuantiles; j++ {
+			// we wll just add noise here
 			values[j] = val + float64(j*10) + r.Float64()*100 - 50
 		}
-		val += 1.0
 
 		rs[i] = &histogram.FloatHistogram{
 			Count:           5 + float64(i*4),
