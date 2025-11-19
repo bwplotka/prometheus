@@ -4,9 +4,10 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
-	"github.com/stretchr/testify/require"
 )
 
 type sampleCase struct {
@@ -18,6 +19,19 @@ type fmtCase struct {
 	name       string
 	newChunkFn func() Chunk
 }
+
+// TODO
+// do another test like this comparing
+// SEND FLOAT HISTOGRAMS (not summaries)
+// 	fmtCases := []fmtCase{
+//		{
+//			name:       "FloatHistogram",
+//			newChunkFn: func() Chunk { return NewFloatHistogramChunk() },
+//		},
+//		{
+//			name:       "FloatHistogramUsingNativeSummary",
+//			newChunkFn: func() Chunk { return NewFloatHistogramChunk2{} },
+//		},
 
 func foreachFmtSampleCase(b *testing.B, fn func(b *testing.B, f fmtCase, s sampleCase)) {
 	const nSamples = 120
@@ -49,6 +63,10 @@ func foreachFmtSampleCase(b *testing.B, fn func(b *testing.B, f fmtCase, s sampl
 		{
 			name:       "FloatHistogram",
 			newChunkFn: func() Chunk { return NewFloatHistogramChunk() },
+		},
+		{
+			name:       "ClassicSummarySimulated",
+			newChunkFn: func() Chunk { return simulatingClassicSummary{} },
 		},
 	}
 
@@ -161,7 +179,7 @@ func BenchmarkAppender(b *testing.B) {
 					b.Fatalf("append sample %d: %s", j, err)
 				}
 				if newChunk != nil {
-					b.Logf("New chunk created at sample %d, old chunk has %d samples", j, c.NumSamples())
+					b.Logf("New chunk created at sample %d, old chunk has %d samples", j, c.NumSamples()) // Logging in bench?
 					c = newChunk
 				}
 				a = newApp
@@ -171,6 +189,33 @@ func BenchmarkAppender(b *testing.B) {
 			require.Equal(b, len(s.h), c.NumSamples())
 		}
 	})
+}
+
+type simulatingClassicSummary struct {
+	countChunk, sumChunk Chunk
+	quantileChunks       []Chunk
+}
+
+func (s *simulatingClassicSummary) Appender() (Appender, error) {
+	// Fetch those appenders from each.
+	return s.Appender()
+}
+
+type simulatingClassicSummaryApp struct {
+	countChunk, sumChunk Appender
+	quantileChunks       []Appender
+}
+
+func (a *simulatingClassicSummaryApp) AppendFloatHistogram(prev *FloatHistogramAppender, t int64, h *histogram.FloatHistogram, appendOnly bool) (c Chunk, isRecoded bool, app Appender, err error) {
+	// Append to all 5-10 chunks
+
+	a.countChunk.Append(t, h.Count)
+	a.sumChunk.Append(t, h.Sum)
+
+	for i, val := range h.QuantileValues {
+		a.quantileChunks[i].Append(t, val)
+	}
+	return nil //. . .. . ./
 }
 
 func BenchmarkIterator(b *testing.B) {

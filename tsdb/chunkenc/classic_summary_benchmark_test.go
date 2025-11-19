@@ -23,7 +23,13 @@ func BenchmarkAppenderClassicSummary(b *testing.B) {
 		b.Run("XOR-N+2/"+tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 
+			// for each
+			// if linear then
+			// for generateLinearValueSummaries
+			//   q1, q2
+			// hERE IS WHERE YOU generate shit, here is not measured
 			for b.Loop() {
+				// HEere is measured stuff
 				r := rand.New(rand.NewSource(10))
 
 				countChunk := NewXORChunk()

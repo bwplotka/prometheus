@@ -120,6 +120,7 @@ func (c *FloatHistogramChunk) Appender() (Appender, error) {
 		}
 	}
 
+	// If you only store quantile you pay a lot for buckets etc and vice versa
 	quantileValuesXor := make([]xorValue, len(it.quantileValues))
 	for i := 0; i < len(it.quantileValues); i++ {
 		quantileValuesXor[i] = xorValue{
