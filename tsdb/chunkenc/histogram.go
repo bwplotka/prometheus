@@ -1323,3 +1323,7 @@ func resize[T any](items []T, n int) []T {
 	}
 	return items[:n]
 }
+
+func (*HistogramAppender) AppendSummary(*SummaryAppender, int64, *histogram.FloatHistogram, bool) (Chunk, bool, Appender, error) {
+	panic("appended a summary sample to a histogram chunk")
+}

@@ -1234,3 +1234,7 @@ func (it *floatHistogramIterator) readXor(v *float64, leading, trailing *uint8) 
 	}
 	return true
 }
+
+func (*FloatHistogramAppender) AppendSummary(*SummaryAppender, int64, *histogram.FloatHistogram, bool) (Chunk, bool, Appender, error) {
+	panic("appended a summary sample to a float histogram chunk")
+}
