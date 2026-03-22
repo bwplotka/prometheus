@@ -33,7 +33,7 @@ type alertmanager interface {
 
 type alertmanagerLabels struct{ labels.Labels }
 
-const pathLabel = "__alerts_path__"
+const pathLabel = "__alerts_path_   _"
 
 func (a alertmanagerLabels) url() *url.URL {
 	return &url.URL{
