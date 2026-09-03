@@ -54,6 +54,13 @@ const (
 	appProtoContentType             = "application/x-protobuf"
 )
 
+const (
+	// ProtobufMessageOTLP represents the OTLP ExportMetricsServiceRequest protobuf message.
+	ProtobufMessageOTLP remoteapi.WriteMessageType = "opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest"
+	// ProtobufMessageOTLPAlias represents the shorthand alias for OTLP ExportMetricsServiceRequest.
+	ProtobufMessageOTLPAlias remoteapi.WriteMessageType = "otlp.ExportMetricsServiceRequest"
+)
+
 var (
 	// UserAgent represents Prometheus version to use for user agent header.
 	UserAgent = version.PrometheusUserAgent()
@@ -61,6 +68,8 @@ var (
 	remoteWriteContentTypeHeaders = map[remoteapi.WriteMessageType]string{
 		remoteapi.WriteV1MessageType: appProtoContentType, // Also application/x-protobuf;proto=prometheus.WriteRequest but simplified for compatibility with 1.x spec.
 		remoteapi.WriteV2MessageType: appProtoContentType + ";proto=io.prometheus.write.v2.Request",
+		ProtobufMessageOTLP:          appProtoContentType,
+		ProtobufMessageOTLPAlias:     appProtoContentType,
 	}
 
 	AcceptedResponseTypes = []prompb.ReadRequest_ResponseType{
@@ -276,7 +285,7 @@ func (c *Client) Store(ctx context.Context, req []byte, attempt int) (WriteRespo
 	if c.writeProtoMsg == remoteapi.WriteV1MessageType {
 		// Compatibility mode for 1.0.
 		httpReq.Header.Set(RemoteWriteVersionHeader, RemoteWriteVersion1HeaderValue)
-	} else {
+	} else if c.writeProtoMsg == remoteapi.WriteV2MessageType {
 		httpReq.Header.Set(RemoteWriteVersionHeader, RemoteWriteVersion20HeaderValue)
 	}
 

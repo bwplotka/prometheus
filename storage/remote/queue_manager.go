@@ -1607,6 +1607,13 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 			}
 			_ = s.sendV2Samples(ctx, pendingDataV2[:n], symbolTable.Symbols(), nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, encBuf, compr)
 			symbolTable.Reset()
+		case ProtobufMessageOTLP, ProtobufMessageOTLPAlias:
+			nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata := countBatchStats(batch, s.qm.sendExemplars, s.qm.sendNativeHistograms)
+			if timer {
+				s.qm.logger.Debug("runShard timer ticked, sending buffered data", "samples", nPendingSamples,
+					"exemplars", nPendingExemplars, "shard", shardNum, "histograms", nPendingHistograms)
+			}
+			_ = s.sendOTLPSamples(ctx, batch, nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, &pBufRaw, encBuf, compr)
 		}
 	}
 
@@ -1706,6 +1713,13 @@ func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, s
 func (s *shards) sendV2Samples(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf *[]byte, buf compression.EncodeBuffer, compr compression.Type) error {
 	begin := time.Now()
 	rs, err := s.sendV2SamplesWithBackoff(ctx, samples, labels, sampleCount, exemplarCount, histogramCount, metadataCount, pBuf, buf, compr)
+	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, metadataCount, rs, time.Since(begin))
+	return err
+}
+
+func (s *shards) sendOTLPSamples(ctx context.Context, batch []timeSeries, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf *[]byte, buf compression.EncodeBuffer, compr compression.Type) error {
+	begin := time.Now()
+	rs, err := s.sendOTLPSamplesWithBackoff(ctx, batch, sampleCount, exemplarCount, histogramCount, metadataCount, pBuf, buf, compr)
 	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, metadataCount, rs, time.Since(begin))
 	return err
 }
@@ -1952,6 +1966,127 @@ func (s *shards) sendV2SamplesWithBackoff(ctx context.Context, samples []writev2
 
 	s.qm.metrics.sentBytesTotal.Add(float64(reqSize))
 	s.qm.metrics.highestSentTimestamp.Set(float64(highest / 1000))
+	return accumulatedStats, err
+}
+
+func countBatchStats(batch []timeSeries, sendExemplars, sendNativeHistograms bool) (int, int, int, int) {
+	var samples, exemplars, histograms, metadata int
+	for _, d := range batch {
+		switch d.sType {
+		case tSample:
+			samples++
+		case tExemplar:
+			if sendExemplars {
+				exemplars++
+			}
+		case tHistogram, tFloatHistogram:
+			if sendNativeHistograms {
+				histograms++
+			}
+		case tMetadata:
+			metadata++
+		}
+	}
+	return samples, exemplars, histograms, metadata
+}
+
+// sendOTLPSamplesWithBackoff to the remote storage with backoff for recoverable errors.
+func (s *shards) sendOTLPSamplesWithBackoff(ctx context.Context, batch []timeSeries, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf *[]byte, buf compression.EncodeBuffer, compr compression.Type) (WriteResponseStats, error) {
+	req, highest, lowest, actualSamples, actualExemplars, actualHistograms, _, err := buildOTLPWriteRequest(
+		s.qm.logger,
+		batch,
+		s.qm.sendExemplars,
+		s.qm.sendNativeHistograms,
+		pBuf,
+		nil,
+		buf,
+		compr,
+	)
+	s.qm.buildRequestLimitTimestamp.Store(lowest)
+	if err != nil {
+		return WriteResponseStats{}, err
+	}
+
+	reqSize := len(req)
+	sc := sendBatchContext{
+		ctx:            ctx,
+		sampleCount:    actualSamples,
+		exemplarCount:  actualExemplars,
+		histogramCount: actualHistograms,
+		metadataCount:  metadataCount,
+		reqSize:        reqSize,
+	}
+
+	metricsUpdater := batchMetricsUpdater{
+		metrics: s.qm.metrics,
+	}
+
+	accumulatedStats := WriteResponseStats{}
+	var accumulatedStatsMu sync.Mutex
+	addStats := func(rs WriteResponseStats) {
+		accumulatedStatsMu.Lock()
+		accumulatedStats = accumulatedStats.Add(rs)
+		accumulatedStatsMu.Unlock()
+	}
+
+	attemptStore := func(try int) error {
+		currentTime := time.Now()
+		lowest := s.qm.buildRequestLimitTimestamp.Load()
+		if isSampleOld(currentTime, time.Duration(s.qm.cfg.SampleAgeLimit), lowest) {
+			req2, _, lowest, _, _, _, _, err := buildOTLPWriteRequest(
+				s.qm.logger,
+				batch,
+				s.qm.sendExemplars,
+				s.qm.sendNativeHistograms,
+				pBuf,
+				func(ts timeSeries) bool {
+					return !isSampleOld(currentTime, time.Duration(s.qm.cfg.SampleAgeLimit), ts.timestamp)
+				},
+				buf,
+				compr,
+			)
+			s.qm.buildRequestLimitTimestamp.Store(lowest)
+			if err != nil {
+				return err
+			}
+			req = req2
+		}
+
+		ctx, span := createBatchSpan(sc.ctx, sc, s.qm.storeClient.Name(), s.qm.storeClient.Endpoint(), try)
+		defer span.End()
+
+		begin := time.Now()
+		metricsUpdater.recordBatchAttempt(sc)
+		rs, err := s.qm.client().Store(ctx, req, try)
+		metricsUpdater.recordLatency(begin)
+		addStats(rs)
+
+		if err == nil {
+			return nil
+		}
+		span.RecordError(err)
+		return err
+	}
+
+	onRetry := func() {
+		metricsUpdater.recordRetry(sc)
+	}
+
+	err = s.qm.sendWriteRequestWithBackoff(ctx, attemptStore, onRetry)
+	if errors.Is(err, context.Canceled) {
+		return accumulatedStats, err
+	}
+
+	s.qm.metrics.sentBytesTotal.Add(float64(reqSize))
+	s.qm.metrics.highestSentTimestamp.Set(float64(highest / 1000))
+
+	if err == nil && !accumulatedStats.Confirmed {
+		return WriteResponseStats{
+			Samples:    actualSamples,
+			Histograms: actualHistograms,
+			Exemplars:  actualExemplars,
+		}, nil
+	}
 	return accumulatedStats, err
 }
 

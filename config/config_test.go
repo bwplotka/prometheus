@@ -1876,6 +1876,21 @@ func TestRemoteWriteRetryOnRateLimit(t *testing.T) {
 	require.False(t, got.RemoteWriteConfigs[1].QueueConfig.RetryOnRateLimit)
 }
 
+func TestRemoteWriteOTLPConfig(t *testing.T) {
+	cfgYAML := `
+remote_write:
+  - url: http://localhost:4318/v1/metrics
+    protobuf_message: opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest
+  - url: http://localhost:4318/v1/metrics
+    protobuf_message: otlp.ExportMetricsServiceRequest
+`
+	cfg, err := Load(cfgYAML, promslog.NewNopLogger())
+	require.NoError(t, err)
+	require.Len(t, cfg.RemoteWriteConfigs, 2)
+	require.Equal(t, ProtobufMessageOTLP, cfg.RemoteWriteConfigs[0].ProtobufMessage)
+	require.Equal(t, ProtobufMessageOTLPAlias, cfg.RemoteWriteConfigs[1].ProtobufMessage)
+}
+
 func TestOTLPSanitizeResourceAttributes(t *testing.T) {
 	t.Run("good config - default resource attributes", func(t *testing.T) {
 		want, err := LoadFile(filepath.Join("testdata", "otlp_sanitize_default_resource_attributes.good.yml"), false, promslog.NewNopLogger())

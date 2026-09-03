@@ -1502,6 +1502,13 @@ type RemoteWriteConfig struct {
 	GoogleIAMConfig  *googleiam.Config       `yaml:"google_iam,omitempty"`
 }
 
+const (
+	// ProtobufMessageOTLP is the protobuf message type for OTLP metrics export.
+	ProtobufMessageOTLP remoteapi.WriteMessageType = "opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest"
+	// ProtobufMessageOTLPAlias is an alias for ProtobufMessageOTLP.
+	ProtobufMessageOTLPAlias remoteapi.WriteMessageType = "otlp.ExportMetricsServiceRequest"
+)
+
 // SetDirectory joins any relative file paths with dir.
 func (c *RemoteWriteConfig) SetDirectory(dir string) {
 	c.HTTPClientConfig.SetDirectory(dir)
@@ -1526,8 +1533,10 @@ func (c *RemoteWriteConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		return err
 	}
 
-	if err := c.ProtobufMessage.Validate(); err != nil {
-		return fmt.Errorf("invalid protobuf_message value: %w", err)
+	if c.ProtobufMessage != ProtobufMessageOTLP && c.ProtobufMessage != ProtobufMessageOTLPAlias {
+		if err := c.ProtobufMessage.Validate(); err != nil {
+			return fmt.Errorf("invalid protobuf_message value: %w", err)
+		}
 	}
 
 	// The UnmarshalYAML method of HTTPClientConfig is not being called because it's not a pointer.
