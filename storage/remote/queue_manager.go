@@ -21,6 +21,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -1925,6 +1926,7 @@ func (s *shards) sendV2SamplesWithBackoff(ctx context.Context, samples []writev2
 
 		begin := time.Now()
 		metricsUpdater.recordBatchAttempt(sc)
+		printV2RequestStats(v2Req)
 		rs, err := s.qm.client().Store(ctx, req, try)
 		metricsUpdater.recordLatency(begin)
 		// TODO(bwplotka): Revisit this once we have Receivers doing retriable partial error
@@ -2037,6 +2039,82 @@ func populateV2TimeSeries(symbolTable *writev2.SymbolsTable, batch []timeSeries,
 		}
 	}
 	return nPendingSamples, nPendingExemplars, nPendingHistograms, nPendingMetadata, nUnexpectedMetadata
+}
+
+func printV2RequestStats(req *writev2.Request) {
+	if req == nil {
+		return
+	}
+	fmt.Println("================== REMOTE WRITE V2 REQUEST METRIC STATISTICS ==================")
+	fmt.Printf("Total TimeSeries: %d, Symbols count: %d\n", len(req.Timeseries), len(req.Symbols))
+	getSymbol := func(ref uint32) string {
+		if int(ref) < len(req.Symbols) {
+			return req.Symbols[ref]
+		}
+		return fmt.Sprintf("<invalid ref %d>", ref)
+	}
+	for i, ts := range req.Timeseries {
+		var metricName string
+		labels := make([]string, 0, len(ts.LabelsRefs)/2)
+		for j := 0; j < len(ts.LabelsRefs); j += 2 {
+			k := getSymbol(ts.LabelsRefs[j])
+			v := getSymbol(ts.LabelsRefs[j+1])
+			if k == "__name__" {
+				metricName = v
+			}
+			labels = append(labels, fmt.Sprintf("%s=%q", k, v))
+		}
+		hasMetadata := ts.Metadata.Type != writev2.Metadata_METRIC_TYPE_UNSPECIFIED || ts.Metadata.UnitRef != 0 || ts.Metadata.HelpRef != 0
+		metaStr := fmt.Sprintf("Type: %s, Unit: %q, Help: %q", ts.Metadata.Type.String(), getSymbol(ts.Metadata.UnitRef), getSymbol(ts.Metadata.HelpRef))
+
+		var hasST bool
+		var stVal int64
+		for _, s := range ts.Samples {
+			if s.StartTimestamp != 0 {
+				hasST = true
+				stVal = s.StartTimestamp
+				break
+			}
+		}
+		for _, h := range ts.Histograms {
+			if h.StartTimestamp != 0 {
+				hasST = true
+				stVal = h.StartTimestamp
+				break
+			}
+		}
+
+		stStr := "none"
+		if hasST {
+			stStr = fmt.Sprintf("%d (%s)", stVal, time.UnixMilli(stVal).UTC().Format(time.RFC3339Nano))
+		}
+
+		fmt.Printf("[%2d] Metric: %s\n", i+1, metricName)
+		fmt.Printf("     Labels: {%s}\n", strings.Join(labels, ", "))
+		fmt.Printf("     Has Metadata: %v (%s)\n", hasMetadata, metaStr)
+		fmt.Printf("     Has ST (Start Timestamp): %v (ST: %s)\n", hasST, stStr)
+		fmt.Printf("     Samples: %d, Histograms: %d, Exemplars: %d\n", len(ts.Samples), len(ts.Histograms), len(ts.Exemplars))
+		if len(ts.Samples) > 0 {
+			for _, s := range ts.Samples {
+				fmt.Printf("       Sample: value=%g, t=%d, st=%d\n", s.Value, s.Timestamp, s.StartTimestamp)
+			}
+		}
+		if len(ts.Histograms) > 0 {
+			for _, h := range ts.Histograms {
+				fmt.Printf("       Histogram: t=%d, st=%d, count=%v\n", h.Timestamp, h.StartTimestamp, h.Count)
+			}
+		}
+		if len(ts.Exemplars) > 0 {
+			for _, ex := range ts.Exemplars {
+				exLabels := make([]string, 0, len(ex.LabelsRefs)/2)
+				for j := 0; j < len(ex.LabelsRefs); j += 2 {
+					exLabels = append(exLabels, fmt.Sprintf("%s=%q", getSymbol(ex.LabelsRefs[j]), getSymbol(ex.LabelsRefs[j+1])))
+				}
+				fmt.Printf("       Exemplar: value=%g, t=%d, labels={%s}\n", ex.Value, ex.Timestamp, strings.Join(exLabels, ", "))
+			}
+		}
+	}
+	fmt.Println("================================================================================")
 }
 
 func (t *QueueManager) sendWriteRequestWithBackoff(ctx context.Context, attempt func(int) error, onRetry func()) error {

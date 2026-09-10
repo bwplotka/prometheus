@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -27,18 +28,52 @@ import (
 )
 
 const (
+	// Change it to e.g. v3.13.0 if you want to install binary.
+	// Otherwise, `build` means code from this repo is ran (without UI).
 	promVersion = "build"
 	port        = 8080
 )
+
+// userProjectRoundTripper adds the X-Goog-User-Project header to requests,
+// which is required for user Application Default Credentials.
+type userProjectRoundTripper struct {
+	project string
+	next    http.RoundTripper
+}
+
+func (rt *userProjectRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if rt.project != "" {
+		req.Header.Set("X-Goog-User-Project", rt.project)
+	}
+	return rt.next.RoundTrip(req)
+}
 
 func TestRWtoGCM(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping test in short mode.")
 	}
 
-	gcmSA := os.Getenv("GCM_SECRET")
-	if gcmSA == "" {
-		t.Skip("skipping as GCM_SECRET env var is not set")
+	creds, err := google.FindDefaultCredentials(t.Context(), "https://www.googleapis.com/auth/monitoring")
+	if err != nil {
+		t.Skipf("skipping as Google default credentials are not set (e.g. run 'gcloud auth application-default login'): %v", err)
+	}
+
+	projectID := creds.ProjectID
+	if projectID == "" {
+		for _, envVar := range []string{"GOOGLE_CLOUD_PROJECT", "PROJECT_ID", "CLOUDSDK_CORE_PROJECT"} {
+			if p := os.Getenv(envVar); p != "" {
+				projectID = p
+				break
+			}
+		}
+	}
+	if projectID == "" {
+		if out, err := exec.CommandContext(t.Context(), "gcloud", "config", "get-value", "project").Output(); err == nil {
+			projectID = strings.TrimSpace(string(out))
+		}
+	}
+	if projectID == "" {
+		t.Skip("skipping as Google Cloud project ID could not be determined (set GOOGLE_CLOUD_PROJECT or run 'gcloud config set project <project>')")
 	}
 
 	var client1, client2, client3 *url.URL
@@ -98,12 +133,7 @@ test_nhcb_histogram_count 2
 		client3, _ = url.Parse(om2Server.URL)
 	}
 
-	creds, err := google.CredentialsFromJSON(t.Context(), []byte(gcmSA), "https://www.googleapis.com/auth/monitoring")
-	require.NoError(t, err)
-
 	tmpDir := t.TempDir()
-	credsFile := filepath.Join(tmpDir, "gcm-sa.json")
-	require.NoError(t, os.WriteFile(credsFile, []byte(gcmSA), 0600))
 
 	cluster := "pe-github-action"
 	location := "europe-west3-a"
@@ -144,11 +174,13 @@ remote_write:
   protobuf_message: "io.prometheus.write.v2.Request"
   # failed_request_logging: true # available on main.
   send_exemplars: true
+  send_native_histograms: true
+  headers:
+    "X-Goog-User-Project": "%s"
   queue_config:
     retry_on_http_429: true
-  google_iam:
-    credentials_file: "%s"
-`, collector, creds.ProjectID, location, cluster, client1.Host, client2.Host, client3.Host, credsFile)
+  google_iam: {}
+`, collector, projectID, location, cluster, client1.Host, client2.Host, client3.Host, projectID)
 
 		configFile := filepath.Join(tmpDir, "prometheus.yml")
 		require.NoError(t, os.WriteFile(configFile, []byte(config), 0600))
@@ -199,9 +231,16 @@ remote_write:
 	}, startupTime, 100*time.Millisecond)
 
 	// Queries
+	oauthTransport := &oauth2.Transport{
+		Source: creds.TokenSource,
+		Base:   http.DefaultTransport,
+	}
 	gcmCl, err := api.NewClient(api.Config{
-		Address: fmt.Sprintf("https://staging-monitoring.sandbox.googleapis.com/v1/projects/%s/location/global/prometheus", creds.ProjectID),
-		Client:  oauth2.NewClient(t.Context(), creds.TokenSource),
+		Address: fmt.Sprintf("https://staging-monitoring.sandbox.googleapis.com/v1/projects/%s/location/global/prometheus", projectID),
+		RoundTripper: &userProjectRoundTripper{
+			project: projectID,
+			next:    oauthTransport,
+		},
 	})
 	require.NoError(t, err)
 	gcmAPI := v1.NewAPI(gcmCl)
