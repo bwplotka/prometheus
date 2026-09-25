@@ -370,12 +370,6 @@ func (c *flagConfig) setFeatureListOptions(logger *slog.Logger) error {
 		return errors.New("cannot enable otlp-deltatocumulative and otlp-native-delta-ingestion features at the same time")
 	}
 
-	if c.enableNHCBasClassic && c.enableClassicAsNHCB {
-		// Each layer would convert the output of the other one back, resulting
-		// in duplicated series for every histogram.
-		return errors.New("cannot enable promql-nhcb-as-classic and promql-classic-as-nhcb features at the same time")
-	}
-
 	return nil
 }
 
@@ -962,11 +956,16 @@ func main() {
 		localStorage                   = &readyStorage{stats: tsdb.NewDBStats()}
 		wrappedStorage storage.Storage = localStorage
 	)
-	switch {
-	case cfg.enableNHCBasClassic:
-		wrappedStorage = storage.NewNHCBAsClassicStorage(localStorage)
-	case cfg.enableClassicAsNHCB:
-		wrappedStorage = storage.NewClassicAsNHCBStorage(localStorage)
+	if cfg.enableNHCBasClassic {
+		wrappedStorage = storage.NewNHCBAsClassicStorage(wrappedStorage)
+	}
+	if cfg.enableClassicAsNHCB {
+		// With both layers enabled, classic-as-NHCB has to be the outer one. It
+		// only asks the inner layer for the base name or for a regex with the
+		// classic suffixes, both passed through by the NHCB-as-classic layer,
+		// so no series is converted twice. The reverse order converts the
+		// classic series to NHCB and back, duplicating them.
+		wrappedStorage = storage.NewClassicAsNHCBStorage(wrappedStorage)
 	}
 
 	var (
