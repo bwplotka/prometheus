@@ -38,7 +38,7 @@ import (
 //
 //   - normal: classic queries only see "self", native queries only "self-nh".
 //   - nhcb-as-classic: classic queries see both jobs, native only "self-nh".
-//   - classic-as-nhcb: classic queries only see "self", native see both jobs.
+//   - dual (both flags): classic and native queries see both jobs.
 //
 // The UI assets have to be built once before, e.g. with `make assets`.
 //
@@ -51,19 +51,19 @@ import (
 //   - Start Prom with --enable-feature=promql-nhcb-as-classic (localhost:1235):
 //     go test -tags demo -timeout 0 -v -run "TestMain_PromQLCompatDemo/nhcb-as-classic" ./cmd/prometheus
 //
-//   - Start Prom with --enable-feature=promql-classic-as-nhcb (localhost:1236):
-//     go test -tags demo -timeout 0 -v -run "TestMain_PromQLCompatDemo/classic-as-nhcb" ./cmd/prometheus
+//   - Start Prom with --enable-feature=promql-nhcb-as-classic,promql-classic-as-nhcb (localhost:1236):
+//     go test -tags demo -timeout 0 -v -run "TestMain_PromQLCompatDemo/dual" ./cmd/prometheus
 func TestMain_PromQLCompatDemo(t *testing.T) {
 	dir, err := os.Getwd()
 	require.NoError(t, err)
 	t.Chdir("../../") // Ensure UI is sourced.
 
 	for _, tc := range []struct {
-		name, port, config, feature string
+		name, port, config, features string
 	}{
 		{name: "normal", port: "1234", config: "demo_histcompat_normal.yaml"},
-		{name: "nhcb-as-classic", port: "1235", config: "demo_histcompat_nhcb_as_classic.yaml", feature: "promql-nhcb-as-classic"},
-		{name: "classic-as-nhcb", port: "1236", config: "demo_histcompat_classic_as_nhcb.yaml", feature: "promql-classic-as-nhcb"},
+		{name: "nhcb-as-classic", port: "1235", config: "demo_histcompat_nhcb_as_classic.yaml", features: "promql-nhcb-as-classic"},
+		{name: "dual", port: "1236", config: "demo_histcompat_dual.yaml", features: "promql-nhcb-as-classic,promql-classic-as-nhcb"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			go openDemoTabs(t, tc.port)
@@ -74,8 +74,8 @@ func TestMain_PromQLCompatDemo(t *testing.T) {
 				"--config.file=" + filepath.Join(dir, tc.config),
 				"--storage.tsdb.path=" + filepath.Join(dir, "data", tc.name),
 			}
-			if tc.feature != "" {
-				os.Args = append(os.Args, "--enable-feature="+tc.feature)
+			if tc.features != "" {
+				os.Args = append(os.Args, "--enable-feature="+tc.features)
 			}
 			main()
 		})
