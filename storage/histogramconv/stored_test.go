@@ -47,6 +47,22 @@ func TestQuerier_Stored(t *testing.T) {
 			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 1}},
 			PositiveBuckets: []int64{1},
 		}
+		// The TSDB returns all but the first histogram of a chunk with the
+		// not_reset hint.
+		nheNotReset = &histogram.Histogram{
+			CounterResetHint: histogram.NotCounterReset,
+			Count:            1,
+			Sum:              1,
+			PositiveSpans:    []histogram.Span{{Offset: 0, Length: 1}},
+			PositiveBuckets:  []int64{1},
+		}
+		nheGauge = &histogram.FloatHistogram{
+			CounterResetHint: histogram.GaugeType,
+			Count:            1,
+			Sum:              1,
+			PositiveSpans:    []histogram.Span{{Offset: 0, Length: 1}},
+			PositiveBuckets:  []float64{1},
+		}
 		// This is how the TSDB returns a staleness marker of a histogram
 		// series, note the exponential schema 0.
 		staleHistogram = &histogram.Histogram{Sum: stale}
@@ -296,6 +312,17 @@ func TestQuerier_Stored(t *testing.T) {
 			expected:    []string{`{__name__="foo_count"} 5@1 1@2 stale@3 5@4 stale@5`},
 		},
 		{
+			// The stored side ends at t=3, the converted one at t=4.
+			name: "stored wins: no consecutive staleness markers",
+			series: []storage.Series{
+				storage.NewListSeries(fooCount, []chunks.Sample{fSample{t: 2, f: 5}, fSample{t: 3, f: stale}}),
+				storage.NewListSeries(foo, []chunks.Sample{hSample{t: 1, h: nhcb}, hSample{t: 4, h: staleHistogram}}),
+			},
+			convertFrom: []Representation{NHCB},
+			matchers:    []*labels.Matcher{name("foo_count")},
+			expected:    []string{`{__name__="foo_count"} 1@1 5@2 stale@3`},
+		},
+		{
 			// E.g. where the scrape loop marks the classic histogram stale
 			// in the scrape where the NHCB starts.
 			name: "stored wins: samples win over staleness markers at the same timestamp",
@@ -382,6 +409,34 @@ func TestQuerier_Stored(t *testing.T) {
 			matchers:    []*labels.Matcher{name("foo")},
 			expected: []string{
 				`{__name__="foo"} {count:1, sum:1, (0.5,1]:1}@1 {count:2, sum:0, [-Inf,+Inf]:2}@2 {count:1, sum:1, (0.5,1]:1}@3 {count:2, sum:0, [-Inf,+Inf]:2}@4`,
+			},
+		},
+		{
+			// The hint of the stored histogram at t=3 refers to the one at
+			// t=1, not to the converted one before it.
+			name: "stored wins: counter reset hints are unknown after samples of the other side",
+			series: []storage.Series{
+				storage.NewListSeries(foo, []chunks.Sample{
+					hSample{t: 1, h: nheNotReset}, hSample{t: 3, h: nheNotReset}, hSample{t: 4, h: nheNotReset},
+				}),
+				storage.NewListSeries(bucket("+Inf"), []chunks.Sample{fSample{t: 2, f: 2}}),
+			},
+			convertFrom: []Representation{Classic},
+			matchers:    []*labels.Matcher{name("foo")},
+			expected: []string{
+				`{__name__="foo"} {count:1, sum:1, (0.5,1]:1}@1(hint=not_reset) {count:2, sum:0, [-Inf,+Inf]:2}@2 {count:1, sum:1, (0.5,1]:1}@3 {count:1, sum:1, (0.5,1]:1}@4(hint=not_reset)`,
+			},
+		},
+		{
+			name: "stored wins: counter reset hints of gauge histograms are kept",
+			series: []storage.Series{
+				storage.NewListSeries(foo, []chunks.Sample{fhSample{t: 1, fh: nheGauge}, fhSample{t: 3, fh: nheGauge}}),
+				storage.NewListSeries(bucket("+Inf"), []chunks.Sample{fSample{t: 2, f: 2}}),
+			},
+			convertFrom: []Representation{Classic},
+			matchers:    []*labels.Matcher{name("foo")},
+			expected: []string{
+				`{__name__="foo"} {count:1, sum:1, (0.5,1]:1}@1(hint=gauge) {count:2, sum:0, [-Inf,+Inf]:2}@2 {count:1, sum:1, (0.5,1]:1}@3(hint=gauge)`,
 			},
 		},
 		{

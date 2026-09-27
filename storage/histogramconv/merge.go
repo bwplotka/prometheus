@@ -18,6 +18,7 @@ import (
 
 	"github.com/prometheus/common/model"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
@@ -307,13 +308,19 @@ func shadow(samples []chunks.Sample, ts []int64) []chunks.Sample {
 //   - Where both have a sample at the same timestamp, the one that is not a
 //     staleness marker is returned, the stored one if both or neither are.
 //   - Other staleness markers only end their own side, so they are dropped
-//     where the sample before them is from the other side, and not a
-//     staleness marker. Otherwise they would hide the other side, e.g. where
-//     the stored series of a histogram are marked stale after the NHCB they
-//     are converted from started, as it happens after a configuration reload
-//     that enables convert_classic_histograms_to_nhcb. Whether the other side
-//     continues after them is not checked, as its next sample might be
-//     outside the selected time range, e.g. in instant queries.
+//     where the sample before them is from the other side. Otherwise they
+//     would hide the other side, e.g. where the stored series of a histogram
+//     are marked stale after the NHCB they are converted from started, as it
+//     happens after a configuration reload that enables
+//     convert_classic_histograms_to_nhcb. Whether the other side continues
+//     after them is not checked, as its next sample might be outside the
+//     selected time range, e.g. in instant queries.
+//   - Staleness markers that would be returned first or right after another
+//     staleness marker are dropped, too.
+//   - Where the returned samples switch sides, native histograms get an
+//     unknown counter reset hint, unless they are gauge histograms, as their
+//     hint refers to the sample before them on their own side. The chain
+//     sample iterator of storage.ChainedSeriesMerge does the same.
 func mergeSamples(stored, converted []chunks.Sample) []chunks.Sample {
 	var (
 		out = make([]chunks.Sample, 0, len(stored)+len(converted))
@@ -346,13 +353,42 @@ func mergeSamples(stored, converted []chunks.Sample) []chunks.Sample {
 			i++
 			j++
 		}
-		if !both && isStale(smpl) && len(out) > 0 && lastConverted != isConverted && !isStale(out[len(out)-1]) {
-			continue
+		switchesSides := len(out) > 0 && lastConverted != isConverted
+		if isStale(smpl) {
+			if len(out) == 0 || isStale(out[len(out)-1]) || (!both && switchesSides) {
+				continue
+			}
+		} else if switchesSides {
+			smpl = withUnknownCounterReset(smpl)
 		}
 		out = append(out, smpl)
 		lastConverted = isConverted
 	}
 	return out
+}
+
+// withUnknownCounterReset returns the sample s with an unknown counter reset
+// hint if it is a native histogram, but not a gauge histogram, and s
+// otherwise. It does not modify the histogram of s, which might be shared.
+func withUnknownCounterReset(s chunks.Sample) chunks.Sample {
+	switch smpl := s.(type) {
+	case hSample:
+		if hint := smpl.h.CounterResetHint; hint != histogram.UnknownCounterReset && hint != histogram.GaugeType {
+			h := *smpl.h
+			h.CounterResetHint = histogram.UnknownCounterReset
+			smpl.h = &h
+		}
+		return smpl
+	case fhSample:
+		if hint := smpl.fh.CounterResetHint; hint != histogram.UnknownCounterReset && hint != histogram.GaugeType {
+			fh := *smpl.fh
+			fh.CounterResetHint = histogram.UnknownCounterReset
+			smpl.fh = &fh
+		}
+		return smpl
+	default:
+		return s
+	}
 }
 
 // isStale reports whether the sample s is a staleness marker.

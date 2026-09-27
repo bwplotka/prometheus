@@ -569,7 +569,9 @@ func TestQuerier_ToClassicExponential(t *testing.T) {
 }
 
 // samplesSummary returns a string per series of ss with its labels and
-// samples, e.g. `{__name__="foo_count"} 4@1 stale@2`.
+// samples, e.g. `{__name__="foo_count"} 4@1 stale@2`. Start timestamps and
+// counter reset hints other than unknown follow the timestamp, e.g.
+// `@1(st=1)` or `@1(hint=not_reset)`.
 func samplesSummary(t *testing.T, ss storage.SeriesSet) []string {
 	t.Helper()
 
@@ -583,7 +585,7 @@ func samplesSummary(t *testing.T, ss storage.SeriesSet) []string {
 		sb.WriteString(s.Labels().String())
 		it = s.Iterator(it)
 		for vt := it.Next(); vt != chunkenc.ValNone; vt = it.Next() {
-			var v string
+			var v, hint string
 			switch vt {
 			case chunkenc.ValFloat:
 				_, f := it.At()
@@ -593,14 +595,17 @@ func samplesSummary(t *testing.T, ss storage.SeriesSet) []string {
 				}
 			case chunkenc.ValHistogram, chunkenc.ValFloatHistogram:
 				_, fh := it.AtFloatHistogram(nil)
-				v = fh.String()
+				v, hint = fh.String(), counterResetHints[fh.CounterResetHint]
 				if value.IsStaleNaN(fh.Sum) {
-					v = "stale"
+					v, hint = "stale", ""
 				}
 			}
 			fmt.Fprintf(&sb, " %s@%d", v, it.AtT())
 			if st := it.AtST(); st != 0 {
 				fmt.Fprintf(&sb, "(st=%d)", st)
+			}
+			if hint != "" {
+				fmt.Fprintf(&sb, "(hint=%s)", hint)
 			}
 		}
 		require.NoError(t, it.Err())
@@ -608,6 +613,14 @@ func samplesSummary(t *testing.T, ss storage.SeriesSet) []string {
 	}
 	require.NoError(t, ss.Err())
 	return summary
+}
+
+// counterResetHints holds the names samplesSummary prints for the counter
+// reset hints other than unknown.
+var counterResetHints = map[histogram.CounterResetHint]string{
+	histogram.CounterReset:    "reset",
+	histogram.NotCounterReset: "not_reset",
+	histogram.GaugeType:       "gauge",
 }
 
 // mockSeriesSet returns the given series and warnings.
