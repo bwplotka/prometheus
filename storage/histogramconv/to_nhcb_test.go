@@ -324,6 +324,16 @@ func TestQuerier_ToNHCBStaleness(t *testing.T) {
 			},
 		},
 		{
+			name: "no leading or consecutive staleness markers",
+			classicSeries: []storage.Series{
+				series("http_requests_bucket", []string{labels.BucketLabel, "+Inf"}, stale, 5, stale, stale, 7),
+				series("http_requests_count", nil, stale, 5, stale, stale, 7),
+			},
+			expected: []string{
+				`{__name__="http_requests"} {count:5, sum:0, [-Inf,+Inf]:5}@2 stale@3 {count:7, sum:0, [-Inf,+Inf]:7}@5`,
+			},
+		},
+		{
 			// Converted series without samples other than staleness markers
 			// are not returned.
 			name: "only stale markers",

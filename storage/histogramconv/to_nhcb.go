@@ -148,8 +148,12 @@ func toNHCB(ss storage.SeriesSet, debug bool) ([]*series, annotations.Annotation
 		for _, t := range timestamps {
 			temp, ok := group.histograms[t]
 			if !ok {
-				// All the classic series of the histogram are stale at t.
-				samples = append(samples, hSample{t: t, h: &histogram.Histogram{Sum: math.Float64frombits(value.StaleNaN)}})
+				// All the classic series of the histogram are stale at t. The
+				// NHCB is only marked stale after a sample that is not a
+				// staleness marker.
+				if len(samples) > 0 && !isStale(samples[len(samples)-1]) {
+					samples = append(samples, hSample{t: t, h: &histogram.Histogram{Sum: math.Float64frombits(value.StaleNaN)}})
+				}
 				continue
 			}
 			h, fh, err := temp.Convert()
