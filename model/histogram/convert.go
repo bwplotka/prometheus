@@ -33,9 +33,10 @@ const (
 
 // ClassicSeriesCache holds precomputed label sets for one native histogram
 // series across repeated ConvertNHCBToClassic or ConvertExponentialToClassic
-// calls.
+// calls. It drops them when it is used for a series with other labels.
 type ClassicSeriesCache struct {
-	baseName     string
+	// lset holds the labels of the series the label sets are cached for.
+	lset         labels.Labels
 	customValues []float64
 
 	bucketLabels []labels.Labels // len(customValues)+1; last entry is the +Inf bucket.
@@ -51,11 +52,11 @@ type ClassicSeriesCache struct {
 	exponentialBucketLabels map[float64]labels.Labels
 }
 
-// invalidateIfNameChanged drops every cached label set once the cache is
-// reused for a differently-named series.
-func (c *ClassicSeriesCache) invalidateIfNameChanged(baseName string) {
-	if c.baseName != baseName {
-		*c = ClassicSeriesCache{baseName: baseName}
+// invalidateIfLabelsChanged drops every cached label set once the cache is
+// reused for a series with other labels.
+func (c *ClassicSeriesCache) invalidateIfLabelsChanged(lset labels.Labels) {
+	if !labels.Equal(c.lset, lset) {
+		*c = ClassicSeriesCache{lset: lset}
 	}
 }
 
@@ -104,7 +105,7 @@ func ConvertNHCBToClassic(nhcb any, lset labels.Labels, lsetBuilder *labels.Buil
 		return errors.New("metric name label '__name__' is missing")
 	}
 	if cache != nil {
-		cache.invalidateIfNameChanged(baseName)
+		cache.invalidateIfLabelsChanged(lset)
 	}
 
 	// We preserve original labels and restore them after conversion.
@@ -334,7 +335,7 @@ func ConvertExponentialToClassic(nh any, boundaries []float64, lset labels.Label
 	}
 
 	if cache != nil {
-		cache.invalidateIfNameChanged(baseName)
+		cache.invalidateIfLabelsChanged(lset)
 	}
 	// Preserve the original labels of the builder, see ConvertNHCBToClassic.
 	oldLabels := lsetBuilder.Labels()

@@ -465,9 +465,9 @@ func TestConvertExponentialToClassic(t *testing.T) {
 		return sample{lset: labels.FromStrings(model.MetricNameLabel, "test_metric_sum"), val: val}
 	}
 
-	// Cases converting the same series share a cache, which checks that the
-	// cache stays correct across changing bucket layouts.
-	caches := map[string]*ClassicSeriesCache{}
+	// All cases share a cache, which checks that the cache stays correct
+	// across changing label sets and bucket layouts.
+	cache := &ClassicSeriesCache{}
 	for _, tc := range []struct {
 		name string
 		h    any
@@ -762,11 +762,6 @@ func TestConvertExponentialToClassic(t *testing.T) {
 			lset := tc.lset
 			if lset.IsEmpty() {
 				lset = labels.FromStrings(model.MetricNameLabel, "test_metric")
-			}
-			cache, ok := caches[lset.String()]
-			if !ok {
-				cache = &ClassicSeriesCache{}
-				caches[lset.String()] = cache
 			}
 			boundaries := tc.boundaries
 			convert := func(h any, onlySuffix string, cache *ClassicSeriesCache) ([]string, error) {

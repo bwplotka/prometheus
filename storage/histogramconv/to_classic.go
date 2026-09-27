@@ -55,9 +55,8 @@ func toClassic(ss storage.SeriesSet, suffix string, from representations, leMatc
 	lsetBuilder := labels.NewBuilder(labels.EmptyLabels())
 	b := newClassicSeriesBuilder()
 	for _, ns := range nhSeries {
-		// A cache holds the label sets of the series converted from one
-		// native histogram series, whatever its labels, so debug mode, which
-		// adds the representation to the labels, needs one per
+		// A cache drops its label sets when the labels change, so debug
+		// mode, which adds the representation to the labels, uses one per
 		// representation.
 		var (
 			nhcbLabels, nheLabels = ns.labels, ns.labels
