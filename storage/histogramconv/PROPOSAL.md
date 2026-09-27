@@ -16,11 +16,11 @@
   * PROM-31, classic histograms stored as native histograms: <https://github.com/prometheus/proposals/blob/main/proposals/0031-classic-histograms-stored-as-native-histograms.md>
 
 > TL;DR: Let PromQL queries written for classic histograms read native histograms and vice versa, by converting
-> between the representations while evaluating the query. One experimental feature flag enables it, and
+> between the representations while evaluating the query. One experimental feature flag gates it, and
 > `--query.convert-histograms-from` lists the representations (`classic`, `nhcb`, `nhe`) to convert from, none by
-> default. A `__convert_stored_as__` matcher overrides that per selector, and `__debug_stored_as__="true"` adds a
-> normal `__stored_as__` label showing which representation each series is stored as. Stored data wins over converted
-> data.
+> default, which disables it. A `__convert_stored_as__` matcher overrides that per selector, and
+> `__debug_stored_as__="true"` adds a normal `__stored_as__` label showing which representation each series is stored
+> as. Stored data wins over converted data.
 
 ## Why
 
@@ -114,14 +114,15 @@ too: the native histogram specification defines them as native histograms with c
 --query.convert-histograms-from=nhcb,nhe,classic
 ```
 
-The feature flag enables the conversions and the `__convert_stored_as__` and `__debug_stored_as__` matchers. It
-replaces the three prototype flags, which were never released.
+The feature flag is required to set `--query.convert-histograms-from`. It replaces the three prototype flags, which
+were never released.
 
-`--query.convert-histograms-from` sets the default for selectors without a `__convert_stored_as__` matcher, see
-below. Like `--enable-feature`, it takes a comma separated list and can be repeated, and any combination is valid. It
-is empty by default: enabling the feature converts nothing until a selector asks for it, and operators opt into the
-conversions their migration needs, e.g. `nhcb` to keep classic histogram queries working after enabling
-`convert_classic_histograms_to_nhcb`. Setting it without the feature flag, or with an unknown value, is an error.
+`--query.convert-histograms-from` enables the conversions and the `__convert_stored_as__` and `__debug_stored_as__`
+matchers, and sets the default for selectors without a `__convert_stored_as__` matcher, see below. Like
+`--enable-feature`, it takes a comma separated list and can be repeated, and any combination is valid. It is empty by
+default, which leaves all of that disabled, so operators opt into the conversions their migration needs, e.g. `nhcb`
+to keep classic histogram queries working after enabling `convert_classic_histograms_to_nhcb`. Setting it without the
+feature flag, or with an unknown value, is an error. The feature flag without it has no effect, and logs a warning.
 
 ### Dispatching selectors
 
@@ -293,7 +294,8 @@ The same happens with NHCB and classic histograms scraped side by side (`convert
 
 Conversions become an option of the PromQL engine, next to toggles like `EnableDelayedNameRemoval`
 (<https://github.com/prometheus/prometheus/blob/aef3a9c1fb268dd79d71432c658a3c608a469915/promql/engine.go#L345-L353>).
-When enabled, the engine wraps the querier it gets for each query
+The option is the list of representations to convert from, and an empty list disables conversions, so no separate
+toggle is needed. When enabled, the engine wraps the querier it gets for each query
 (<https://github.com/prometheus/prometheus/blob/aef3a9c1fb268dd79d71432c658a3c608a469915/promql/engine.go#L819>),
 which sits above the fanout to local and remote read storage, and nothing else in the engine changes. So:
 

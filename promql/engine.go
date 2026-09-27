@@ -356,15 +356,13 @@ type EngineOpts struct {
 	// UseStartTimestamps enables start timestamp usage in functions such as rate().
 	UseStartTimestamps bool
 
-	// EnableHistogramConversion converts between histogram representations at
-	// query time, e.g. so that selectors for classic histogram series also
-	// return the classic histogram series converted from native histograms,
-	// see the histogramconv package. It also enables the control matchers of
-	// that package, e.g. __convert_stored_as__.
-	EnableHistogramConversion bool
-	// HistogramConversionFrom holds the histogram representations converted
-	// from, if EnableHistogramConversion is set, unless a
-	// __convert_stored_as__ matcher of a selector overrides them.
+	// HistogramConversionFrom holds the histogram representations to convert
+	// from at query time, e.g. so that selectors for classic histogram series
+	// also return the classic histogram series converted from native
+	// histograms, see the histogramconv package. It also enables the control
+	// matchers of that package, e.g. __convert_stored_as__, which override it
+	// per selector. Query-time histogram conversion is disabled if it is
+	// empty.
 	HistogramConversionFrom []histogramconv.Representation
 
 	// FeatureRegistry is the registry for tracking enabled/disabled features.
@@ -377,24 +375,23 @@ type EngineOpts struct {
 // Engine handles the lifetime of queries from beginning to end.
 // It is connected to a querier.
 type Engine struct {
-	logger                    *slog.Logger
-	metrics                   *engineMetrics
-	timeout                   time.Duration
-	maxSamplesPerQuery        int
-	activeQueryTracker        QueryTracker
-	queryLogger               QueryLogger
-	queryLoggerLock           sync.RWMutex
-	lookbackDelta             time.Duration
-	noStepSubqueryIntervalFn  func(rangeMillis int64) int64
-	enableAtModifier          bool
-	enableNegativeOffset      bool
-	enablePerStepStats        bool
-	enableDelayedNameRemoval  bool
-	enableTypeAndUnitLabels   bool
-	useStartTimestamps        bool
-	enableHistogramConversion bool
-	histogramConversionFrom   []histogramconv.Representation
-	parser                    parser.Parser
+	logger                   *slog.Logger
+	metrics                  *engineMetrics
+	timeout                  time.Duration
+	maxSamplesPerQuery       int
+	activeQueryTracker       QueryTracker
+	queryLogger              QueryLogger
+	queryLoggerLock          sync.RWMutex
+	lookbackDelta            time.Duration
+	noStepSubqueryIntervalFn func(rangeMillis int64) int64
+	enableAtModifier         bool
+	enableNegativeOffset     bool
+	enablePerStepStats       bool
+	enableDelayedNameRemoval bool
+	enableTypeAndUnitLabels  bool
+	useStartTimestamps       bool
+	histogramConversionFrom  []histogramconv.Representation
+	parser                   parser.Parser
 }
 
 // NewEngine returns a new engine.
@@ -509,7 +506,7 @@ func NewEngine(opts EngineOpts) *Engine {
 		r.Set(features.PromQL, "per_step_stats", opts.EnablePerStepStats)
 		r.Set(features.PromQL, "delayed_name_removal", opts.EnableDelayedNameRemoval)
 		r.Set(features.PromQL, "type_and_unit_labels", opts.EnableTypeAndUnitLabels)
-		r.Set(features.PromQL, "histogram_conversion", opts.EnableHistogramConversion)
+		r.Set(features.PromQL, "histogram_conversion", len(opts.HistogramConversionFrom) > 0)
 		r.Enable(features.PromQL, "per_query_lookback_delta")
 		r.Enable(features.PromQL, "subqueries")
 
@@ -519,22 +516,21 @@ func NewEngine(opts EngineOpts) *Engine {
 	}
 
 	return &Engine{
-		timeout:                   opts.Timeout,
-		logger:                    opts.Logger,
-		metrics:                   metrics,
-		maxSamplesPerQuery:        opts.MaxSamples,
-		activeQueryTracker:        opts.ActiveQueryTracker,
-		lookbackDelta:             opts.LookbackDelta,
-		noStepSubqueryIntervalFn:  opts.NoStepSubqueryIntervalFn,
-		enableAtModifier:          opts.EnableAtModifier,
-		enableNegativeOffset:      opts.EnableNegativeOffset,
-		enablePerStepStats:        opts.EnablePerStepStats,
-		enableDelayedNameRemoval:  opts.EnableDelayedNameRemoval,
-		enableTypeAndUnitLabels:   opts.EnableTypeAndUnitLabels,
-		useStartTimestamps:        opts.UseStartTimestamps,
-		enableHistogramConversion: opts.EnableHistogramConversion,
-		histogramConversionFrom:   opts.HistogramConversionFrom,
-		parser:                    opts.Parser,
+		timeout:                  opts.Timeout,
+		logger:                   opts.Logger,
+		metrics:                  metrics,
+		maxSamplesPerQuery:       opts.MaxSamples,
+		activeQueryTracker:       opts.ActiveQueryTracker,
+		lookbackDelta:            opts.LookbackDelta,
+		noStepSubqueryIntervalFn: opts.NoStepSubqueryIntervalFn,
+		enableAtModifier:         opts.EnableAtModifier,
+		enableNegativeOffset:     opts.EnableNegativeOffset,
+		enablePerStepStats:       opts.EnablePerStepStats,
+		enableDelayedNameRemoval: opts.EnableDelayedNameRemoval,
+		enableTypeAndUnitLabels:  opts.EnableTypeAndUnitLabels,
+		useStartTimestamps:       opts.UseStartTimestamps,
+		histogramConversionFrom:  opts.HistogramConversionFrom,
+		parser:                   opts.Parser,
 	}
 }
 
@@ -843,7 +839,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 	}
 	querierSpan.End()
 	defer querier.Close()
-	if ng.enableHistogramConversion {
+	if len(ng.histogramConversionFrom) > 0 {
 		querier = histogramconv.NewQuerier(querier, ng.histogramConversionFrom)
 	}
 

@@ -388,7 +388,8 @@ written.
 
 `--query.convert-histograms-from` lists the representations to convert from. Like
 `--enable-feature`, it takes a comma separated list and can be repeated. It is empty by default,
-so enabling the feature alone converts nothing:
+and the feature has no effect, including the control labels described below, until it lists at
+least one representation:
 
 * `classic`: The `_bucket`, `_count` and `_sum` series of classic histograms are converted to NHCB
   with the same buckets, for selectors of the base name.
@@ -462,7 +463,8 @@ For example, with `--query.convert-histograms-from=nhcb`:
 | `foo_bucket{__convert_stored_as__=~".*", __debug_stored_as__="true"}` | Stored series, plus the series converted from every representation, with `__stored_as__`. |
 
 As for any selector, at least one matcher besides the control matchers must not match the empty
-value. Where the feature is disabled, selectors with control matchers select nothing.
+value. Where the feature is disabled, or `--query.convert-histograms-from` is empty, selectors with
+control matchers select nothing.
 
 Unlike NHCB, native histograms with an exponential schema have no fixed bucket boundaries. So that
 the converted `_bucket` series can be aggregated across series and over time, e.g. with

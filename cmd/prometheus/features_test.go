@@ -146,7 +146,7 @@ func TestSetFeatureListOptions_HistogramConversion(t *testing.T) {
 			name: "disabled",
 		},
 		{
-			name:            "enabled without conversions by default",
+			name:            "enabled without representations to convert from",
 			features:        []string{"promql-histogram-conversion"},
 			expectedEnabled: true,
 		},

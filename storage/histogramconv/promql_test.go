@@ -29,14 +29,10 @@ func TestPromQL(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		convertFrom []histogramconv.Representation
-		// disabled disables query-time histogram conversion.
-		disabled bool
-		input    string
+		input       string
 	}{
 		{
-			name:        "disabled: nothing is converted if the feature is disabled",
-			convertFrom: histogramconv.Representations(),
-			disabled:    true,
+			name: "disabled: nothing is converted without representations to convert from",
 			input: `
 load 1m
 	rpc_latency_seconds{job="a"}	{{schema:-53 sum:6 count:4 custom_values:[1 2] buckets:[1 2 1]}}x5
@@ -56,19 +52,20 @@ eval instant at 2m rpc_latency_seconds_count{__debug_stored_as__="true"}
 `,
 		},
 		{
-			name: "none: nothing is converted by default",
+			name:        "nhe: a control matcher enables conversions that the flag does not list",
+			convertFrom: []histogramconv.Representation{histogramconv.NHE},
 			input: `
 load 1m
 	rpc_latency_seconds{job="a"}	{{schema:-53 sum:6 count:4 custom_values:[1 2] buckets:[1 2 1]}}x5
 	rpc_latency_seconds_count{job="b"}	4x5
 
+# The NHCB is not converted, as the flag does not list nhcb.
 eval instant at 2m rpc_latency_seconds_count
 	rpc_latency_seconds_count{job="b"} 4
 
 eval instant at 2m rpc_latency_seconds
 	rpc_latency_seconds{job="a"} {{schema:-53 sum:6 count:4 custom_values:[1 2] buckets:[1 2 1]}}
 
-# A control matcher enables conversions that the flag does not list.
 eval instant at 2m rpc_latency_seconds_count{__convert_stored_as__=~"classic|nhcb"}
 	rpc_latency_seconds_count{job="a"} 4
 	rpc_latency_seconds_count{job="b"} 4
@@ -76,7 +73,8 @@ eval instant at 2m rpc_latency_seconds_count{__convert_stored_as__=~"classic|nhc
 		},
 		{
 			// The representation of the stored series changes at 3m.
-			name: "none: debug splits a stored series by representation",
+			name:        "all: debug splits a stored series by representation",
+			convertFrom: histogramconv.Representations(),
 			input: `
 load 1m
 	rpc_latency_seconds{job="a"}	{{schema:-53 sum:6 count:4 custom_values:[1] buckets:[1 3]}}x2 {{schema:0 sum:6 count:4 buckets:[1 2 1]}}x2
@@ -962,16 +960,15 @@ eval range from 3m to 6m step 1m foo_bucket{le="+Inf", __debug_stored_as__="true
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			promqltest.RunTest(t, tc.input, promqltest.NewTestEngineWithOpts(t, promql.EngineOpts{
-				MaxSamples:                promqltest.DefaultMaxSamplesPerQuery,
-				Timeout:                   100 * time.Second,
-				NoStepSubqueryIntervalFn:  func(int64) int64 { return time.Minute.Milliseconds() },
-				EnableAtModifier:          true,
-				EnableNegativeOffset:      true,
-				EnableDelayedNameRemoval:  true,
-				UseStartTimestamps:        true,
-				EnableHistogramConversion: !tc.disabled,
-				HistogramConversionFrom:   tc.convertFrom,
-				Parser:                    parser.NewParser(promqltest.TestParserOpts),
+				MaxSamples:               promqltest.DefaultMaxSamplesPerQuery,
+				Timeout:                  100 * time.Second,
+				NoStepSubqueryIntervalFn: func(int64) int64 { return time.Minute.Milliseconds() },
+				EnableAtModifier:         true,
+				EnableNegativeOffset:     true,
+				EnableDelayedNameRemoval: true,
+				UseStartTimestamps:       true,
+				HistogramConversionFrom:  tc.convertFrom,
+				Parser:                   parser.NewParser(promqltest.TestParserOpts),
 			}))
 		})
 	}

@@ -379,6 +379,9 @@ func (c *flagConfig) setFeatureListOptions(logger *slog.Logger) error {
 	if len(from) > 0 && !c.enableHistogramConversion {
 		return errors.New("--query.convert-histograms-from requires --enable-feature=promql-histogram-conversion")
 	}
+	if c.enableHistogramConversion && len(from) == 0 {
+		logger.Warn("Experimental query-time histogram conversion has no effect, as --query.convert-histograms-from is empty")
+	}
 	c.histogramConversionFrom = from
 
 	return nil
@@ -665,7 +668,7 @@ func main() {
 	serverOnlyFlag(a, "query.max-samples", "Maximum number of samples a single query can load into memory. Note that queries will fail if they try to load more samples than this into memory, so this also limits the number of samples a query can return.").
 		Default("50000000").IntVar(&cfg.queryMaxSamples)
 
-	serverOnlyFlag(a, "query.convert-histograms-from", "Comma separated histogram representations to convert from at query time: PromQL selectors for classic histogram series also return the ones converted from native histograms, and selectors for native histograms the ones converted from classic histograms. Nothing is stored. A __convert_stored_as__ matcher overrides it per selector. Valid options: classic, nhcb, nhe. Requires --enable-feature=promql-histogram-conversion.").
+	serverOnlyFlag(a, "query.convert-histograms-from", "Comma separated histogram representations to convert from at query time: PromQL selectors for classic histogram series also return the ones converted from native histograms, and selectors for native histograms the ones converted from classic histograms. Nothing is stored. A __convert_stored_as__ matcher overrides it per selector. Valid options: classic, nhcb, nhe. If empty, query-time histogram conversion is disabled, including the __convert_stored_as__ matchers. Requires --enable-feature=promql-histogram-conversion.").
 		StringsVar(&cfg.convertHistogramsFrom)
 
 	a.Flag("scrape.discovery-reload-interval", "Interval used by scrape manager to throttle target groups updates.").
@@ -1051,16 +1054,15 @@ func main() {
 			NoStepSubqueryIntervalFn: noStepSubqueryInterval.Get,
 			// EnableAtModifier and EnableNegativeOffset have to be
 			// always on for regular PromQL as of Prometheus v2.33.
-			EnableAtModifier:          true,
-			EnableNegativeOffset:      true,
-			EnablePerStepStats:        cfg.enablePerStepStats,
-			EnableDelayedNameRemoval:  cfg.promqlEnableDelayedNameRemoval,
-			EnableTypeAndUnitLabels:   cfg.scrape.EnableTypeAndUnitLabels,
-			UseStartTimestamps:        cfg.useStartTimestamps,
-			EnableHistogramConversion: cfg.enableHistogramConversion,
-			HistogramConversionFrom:   cfg.histogramConversionFrom,
-			FeatureRegistry:           features.DefaultRegistry,
-			Parser:                    promqlParser,
+			EnableAtModifier:         true,
+			EnableNegativeOffset:     true,
+			EnablePerStepStats:       cfg.enablePerStepStats,
+			EnableDelayedNameRemoval: cfg.promqlEnableDelayedNameRemoval,
+			EnableTypeAndUnitLabels:  cfg.scrape.EnableTypeAndUnitLabels,
+			UseStartTimestamps:       cfg.useStartTimestamps,
+			HistogramConversionFrom:  cfg.histogramConversionFrom,
+			FeatureRegistry:          features.DefaultRegistry,
+			Parser:                   promqlParser,
 		}
 
 		queryEngine = promql.NewEngine(opts)
