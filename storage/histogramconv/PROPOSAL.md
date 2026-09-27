@@ -345,7 +345,8 @@ or interpolated, but:
 ### Performance
 
 * Every converted selector does one more select. Selectors with a `le` matcher do another one to find the timestamps
-  of the stored classic histograms, if anything was converted.
+  of the stored classic histograms, even if nothing is converted, as queriers that merge remote read storage do not
+  allow selects after the first series is read. Its series are only read if anything is converted.
 * Conversions, and selectors with control matchers, buffer the samples they read, the classic side all native
   histograms of the selector, as the derived buckets depend on all of them. That memory is not accounted in
   `--query.max-samples` yet, and should be.
