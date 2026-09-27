@@ -17,18 +17,23 @@ import (
 	"math"
 	"slices"
 
+	"github.com/prometheus/common/model"
+
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/util/annotations"
 )
 
 // toClassic converts the native histograms of ss, of the representations in
 // from, to the classic histogram series with the given suffix, and returns the
 // converted series whose le label matches all leMatchers. In debug mode, the
 // converted series have the StoredAsLabel, set to the representation of the
-// native histograms they were converted from.
+// native histograms they were converted from. An invalid native histogram,
+// e.g. with fewer buckets than its spans need, is skipped and reported in the
+// returned annotations.
 //
 // Native histograms with an exponential schema have no fixed bucket
 // boundaries. So that the resulting classic histograms can be aggregated by
@@ -44,10 +49,10 @@ import (
 // like the scrape loop marks series stale that disappear from a target.
 // Converted samples other than staleness markers have the start timestamp of
 // the native histogram sample they were converted from.
-func toClassic(ss storage.SeriesSet, suffix string, from representations, leMatchers []*labels.Matcher, debug bool) ([]*series, error) {
-	nhSeries, err := readNativeHistograms(ss, from)
+func toClassic(ss storage.SeriesSet, suffix string, from representations, leMatchers []*labels.Matcher, debug bool) ([]*series, annotations.Annotations, error) {
+	nhSeries, warnings, err := readNativeHistograms(ss, from)
 	if err != nil {
-		return nil, err
+		return nil, warnings, err
 	}
 	var boundaries []float64
 	if from.has(NHE) && suffix == histogram.ClassicSuffixBucket {
@@ -80,7 +85,7 @@ func toClassic(ss storage.SeriesSet, suffix string, from representations, leMatc
 					err = histogram.ConvertNHCBToClassic(smpl.fh, nhcbLabels, lsetBuilder, suffix, nhcbCache, b.emit)
 				}
 				if err != nil {
-					return nil, err
+					return nil, warnings, err
 				}
 			}
 			b.endSample()
@@ -97,7 +102,7 @@ Series:
 		}
 		converted = append(converted, s)
 	}
-	return converted, nil
+	return converted, warnings, nil
 }
 
 // nativeHistogramSeries holds the samples of a native histogram series.
@@ -115,11 +120,14 @@ type nativeHistogramSample struct {
 }
 
 // readNativeHistograms drains ss and returns its series. Only the native
-// histograms of the representations in from are converted.
-func readNativeHistograms(ss storage.SeriesSet, from representations) ([]nativeHistogramSeries, error) {
+// histograms of the representations in from are converted, and only if they
+// are valid, as the conversion might panic otherwise. Invalid ones are
+// reported in the returned annotations.
+func readNativeHistograms(ss storage.SeriesSet, from representations) ([]nativeHistogramSeries, annotations.Annotations, error) {
 	var (
 		nhSeries []nativeHistogramSeries
 		it       chunkenc.Iterator
+		warnings annotations.Annotations
 	)
 	for ss.Next() {
 		s := ss.At()
@@ -130,17 +138,21 @@ func readNativeHistograms(ss storage.SeriesSet, from representations) ([]nativeH
 			if valType == chunkenc.ValHistogram || valType == chunkenc.ValFloatHistogram {
 				// This works for histograms with integer counts, too.
 				if _, fh := it.AtFloatHistogram(nil); convertible(fh, from) {
-					smpl.fh = fh
+					if err := fh.Validate(); err != nil {
+						warnings.Add(annotations.NewNativeToClassicConversionWarning(ns.labels.Get(model.MetricNameLabel), err))
+					} else {
+						smpl.fh = fh
+					}
 				}
 			}
 			ns.samples = append(ns.samples, smpl)
 		}
 		if err := it.Err(); err != nil {
-			return nil, err
+			return nil, warnings, err
 		}
 		nhSeries = append(nhSeries, ns)
 	}
-	return nhSeries, ss.Err()
+	return nhSeries, warnings, ss.Err()
 }
 
 // convertible reports whether the native histogram fh, of the representations

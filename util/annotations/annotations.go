@@ -168,6 +168,7 @@ var (
 	MismatchedCustomBucketsHistogramsInfo   = fmt.Errorf("%w: mismatched custom buckets were reconciled during", PromQLInfo)
 	StartTimeOverlapWarning                 = fmt.Errorf("%w: sample has start time that overlaps with previous sample timestamp", PromQLWarning)
 	ClassicToNHCBConversionWarning          = fmt.Errorf("%w: classic histogram could not be converted to a native histogram with custom buckets", PromQLWarning)
+	NativeToClassicConversionWarning        = fmt.Errorf("%w: native histogram could not be converted to classic histogram series", PromQLWarning)
 )
 
 // annoError extends the standard error interface to provide additional functionality
@@ -547,4 +548,12 @@ func NewStartTimeOverlapWarning(metricName string, pos posrange.PositionRange) e
 // position of the triggering expression.
 func NewClassicToNHCBConversionWarning(metricName string, err error) error {
 	return fmt.Errorf("%w: %w", maybeAddMetricName(ClassicToNHCBConversionWarning, metricName), err)
+}
+
+// NewNativeToClassicConversionWarning is used when a native histogram cannot
+// be converted into classic histogram series at query time. The conversion
+// happens in the storage layer, hence the annotation carries no position of
+// the triggering expression.
+func NewNativeToClassicConversionWarning(metricName string, err error) error {
+	return fmt.Errorf("%w: %w", maybeAddMetricName(NativeToClassicConversionWarning, metricName), err)
 }

@@ -489,8 +489,9 @@ Also note that:
   exponentially within the buckets of a native histogram with an exponential schema. Quantiles
   calculated from converted classic series hence differ from the quantiles calculated from the
   exponential histograms they were converted from.
-* A classic histogram that cannot be converted, e.g. because its bucket counts are not cumulative,
-  is skipped for the affected timestamps, and a warning annotation is attached to the query result.
+* A histogram that cannot be converted, e.g. a classic histogram whose bucket counts are not
+  cumulative or an invalid native histogram, is skipped for the affected timestamps, and a warning
+  annotation is attached to the query result.
 
 Limitations:
 

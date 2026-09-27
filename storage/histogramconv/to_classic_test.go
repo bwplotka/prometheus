@@ -431,6 +431,11 @@ func TestQuerier_ToClassicExponential(t *testing.T) {
 	// This is how the TSDB returns a stale marker of a histogram series,
 	// note the exponential schema 0.
 	staleMarker := &histogram.FloatHistogram{Sum: math.Float64frombits(value.StaleNaN)}
+	// invalid has fewer buckets than its spans need. Its schema is higher
+	// than the one of the other histograms, so it would be reduced to theirs
+	// to derive the boundaries.
+	invalid := exponential(1, 0, 1, 2)
+	invalid.PositiveSpans[0].Length = 3
 	name := func(n string) *labels.Matcher {
 		return labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, n)
 	}
@@ -441,6 +446,8 @@ func TestQuerier_ToClassicExponential(t *testing.T) {
 		series   []storage.Series
 		matchers []*labels.Matcher
 		expected []string
+		// warning is the expected warning, if any.
+		warning string
 	}{
 		{
 			// The buckets are (0.5,1], (1,2] and (2,4].
@@ -559,11 +566,28 @@ func TestQuerier_ToClassicExponential(t *testing.T) {
 			matchers: []*labels.Matcher{name("foo_bucket"), labels.MustNewMatcher(labels.MatchEqual, labels.BucketLabel, "2.0")},
 			expected: []string{`{__name__="foo_bucket", le="2.0"} 3@1 stale@2 3@3`},
 		},
+		{
+			name: "invalid histograms are not converted",
+			from: []Representation{NHCB, NHE},
+			series: []storage.Series{storage.NewListSeries(labels.FromStrings("__name__", "foo"), []chunks.Sample{
+				fhSample{t: 1, fh: exponential(0, 0, 1, 2, 1)}, fhSample{t: 2, fh: invalid}, fhSample{t: 3, fh: exponential(0, 0, 1, 2, 1)},
+			})},
+			matchers: []*labels.Matcher{name("foo_bucket"), labels.MustNewMatcher(labels.MatchEqual, labels.BucketLabel, "2.0")},
+			expected: []string{`{__name__="foo_bucket", le="2.0"} 3@1 stale@2 3@3`},
+			warning:  `native histogram could not be converted to classic histogram series for metric name "foo": positive side: spans need 3 buckets, have 2 buckets`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := NewQuerier(&nhcbMockQuerier{nhcbSeries: tc.series}, tc.from)
 			ss := q.Select(context.Background(), false, nil, tc.matchers...)
 			require.ElementsMatch(t, tc.expected, samplesSummary(t, ss))
+			warnings, _ := ss.Warnings().AsStrings("", 0, 0)
+			if tc.warning == "" {
+				require.Empty(t, warnings)
+				return
+			}
+			require.Len(t, warnings, 1)
+			require.Contains(t, warnings[0], tc.warning)
 		})
 	}
 }

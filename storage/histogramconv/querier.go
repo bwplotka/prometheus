@@ -236,15 +236,15 @@ func (s *seriesSet) readStored() ([]*series, error) {
 func (s *seriesSet) convert() ([]*series, error) {
 	var (
 		converted []*series
+		warnings  annotations.Annotations
 		err       error
 	)
 	if s.sel.suffix != "" {
-		converted, err = toClassic(s.sourceSet, s.sel.suffix, s.sel.from, s.sel.leMatchers, s.sel.debug)
+		converted, warnings, err = toClassic(s.sourceSet, s.sel.suffix, s.sel.from, s.sel.leMatchers, s.sel.debug)
 	} else {
-		var ws annotations.Annotations
-		converted, ws, err = toNHCB(s.sourceSet, s.sel.debug)
-		s.warnings.Merge(ws)
+		converted, warnings, err = toNHCB(s.sourceSet, s.sel.debug)
 	}
+	s.warnings.Merge(warnings)
 	s.warnings.Merge(s.sourceSet.Warnings())
 	return converted, err
 }
