@@ -17,7 +17,6 @@ import (
 	"context"
 	"errors"
 	"math"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -49,6 +48,7 @@ func classicHistogramSeries(extraLabels ...string) []storage.Series {
 }
 
 func TestQuerier_ToNHCB(t *testing.T) {
+	// nhcb is the NHCB converted from classicHistogramSeries at t=1.
 	nhcb := &histogram.Histogram{
 		Schema:          histogram.CustomBucketsSchema,
 		Count:           5,
@@ -56,6 +56,16 @@ func TestQuerier_ToNHCB(t *testing.T) {
 		CustomValues:    []float64{1},
 		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
 		PositiveBuckets: []int64{2, 1},
+	}
+	// storedNHCB has other values than nhcb, so that it can be told apart
+	// from it.
+	storedNHCB := &histogram.Histogram{
+		Schema:          histogram.CustomBucketsSchema,
+		Count:           6,
+		Sum:             12,
+		CustomValues:    []float64{1},
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []int64{1, 4},
 	}
 
 	tests := []struct {
@@ -69,16 +79,16 @@ func TestQuerier_ToNHCB(t *testing.T) {
 			name:          "no classic histogram - native series passes through",
 			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
 			nativeSeries: []storage.Series{
-				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests"), []chunks.Sample{hSample{t: 1, h: nhcb}}),
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests"), []chunks.Sample{hSample{t: 1, h: storedNHCB}}),
 			},
-			expectedSeries: []string{`{__name__="http_requests"} @[1]`},
+			expectedSeries: []string{`{__name__="http_requests"} {count:6, sum:12, [-Inf,1]:1, (1,+Inf]:5}@1`},
 		},
 		{
 			name:          "classic histogram only - converted to NHCB",
 			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
 			classicSeries: classicHistogramSeries(),
 			expectedSeries: []string{
-				`{__name__="http_requests"} @[1] @[2]`,
+				`{__name__="http_requests"} {count:5, sum:10, [-Inf,1]:2, (1,+Inf]:3}@1 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@2`,
 			},
 		},
 		{
@@ -92,8 +102,8 @@ func TestQuerier_ToNHCB(t *testing.T) {
 			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
 			classicSeries: append(classicHistogramSeries("job", "api"), classicHistogramSeries("job", "web")...),
 			expectedSeries: []string{
-				`{__name__="http_requests", job="api"} @[1] @[2]`,
-				`{__name__="http_requests", job="web"} @[1] @[2]`,
+				`{__name__="http_requests", job="api"} {count:5, sum:10, [-Inf,1]:2, (1,+Inf]:3}@1 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@2`,
+				`{__name__="http_requests", job="web"} {count:5, sum:10, [-Inf,1]:2, (1,+Inf]:3}@1 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@2`,
 			},
 		},
 		{
@@ -104,10 +114,10 @@ func TestQuerier_ToNHCB(t *testing.T) {
 			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
 			classicSeries: classicHistogramSeries(),
 			nativeSeries: []storage.Series{
-				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests"), []chunks.Sample{hSample{t: 1, h: nhcb}}),
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests"), []chunks.Sample{hSample{t: 1, h: storedNHCB}}),
 			},
 			expectedSeries: []string{
-				`{__name__="http_requests"} @[1] @[2]`,
+				`{__name__="http_requests"} {count:6, sum:12, [-Inf,1]:1, (1,+Inf]:5}@1 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@2`,
 			},
 		},
 		{
@@ -132,7 +142,7 @@ func TestQuerier_ToNHCB(t *testing.T) {
 				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "+Inf"), []chunks.Sample{fSample{t: 1, f: 5}}),
 				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "1"), []chunks.Sample{fSample{t: 1, f: 2}}),
 			},
-			expectedSeries: []string{`{__name__="http_requests"} @[1]`},
+			expectedSeries: []string{`{__name__="http_requests"} {count:5, sum:0, [-Inf,1]:2, (1,+Inf]:3}@1`},
 		},
 		{
 			name:          "no data at all",
@@ -148,12 +158,7 @@ func TestQuerier_ToNHCB(t *testing.T) {
 			}, []Representation{Classic})
 
 			ss := q.Select(context.Background(), false, nil, tc.queryMatchers...)
-			var got []string
-			for ss.Next() {
-				got = append(got, seriesSummary(t, ss.At()))
-			}
-			require.NoError(t, ss.Err())
-			require.Equal(t, tc.expectedSeries, got)
+			require.Equal(t, tc.expectedSeries, samplesSummary(t, ss))
 		})
 	}
 
@@ -408,23 +413,6 @@ func TestQuerier_ToNHCBWarningPropagation(t *testing.T) {
 	expected.Merge(nativeWarning)
 	expected.Merge(classicWarning)
 	require.Equal(t, *expected, ss.Warnings())
-}
-
-// seriesSummary renders a series as its labels followed by its sample
-// timestamps, which keeps the expectations of table driven tests readable.
-func seriesSummary(t *testing.T, s storage.Series) string {
-	t.Helper()
-
-	var sb strings.Builder
-	sb.WriteString(s.Labels().String())
-	it := s.Iterator(nil)
-	for valType := it.Next(); valType != chunkenc.ValNone; valType = it.Next() {
-		sb.WriteString(" @[")
-		sb.WriteString(strconv.FormatInt(it.AtT(), 10))
-		sb.WriteString("]")
-	}
-	require.NoError(t, it.Err())
-	return sb.String()
 }
 
 // classicMockQuerier answers queries for the base metric name with
