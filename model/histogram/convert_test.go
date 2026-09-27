@@ -297,67 +297,43 @@ func TestConvertNHCBToClassicHistogram(t *testing.T) {
 		},
 	}
 
+	// All cases share a cache, which checks that the cache stays correct
+	// across changing label sets and bucket layouts.
+	cache := &ClassicSeriesCache{}
 	labelBuilder := labels.NewBuilder(labels.EmptyLabels())
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var emittedSamples []sample
-			err := ConvertNHCBToClassic(tt.nhcb, tt.labels, labelBuilder, "", nil, func(lbls labels.Labels, val float64) error {
-				emittedSamples = append(emittedSamples, sample{lset: lbls, val: val})
-				return nil
-			})
-			require.Equal(t, tt.expectErr, err != nil, "unexpected error: %v", err)
-			if !tt.expectErr {
-				require.Len(t, emittedSamples, len(tt.expected))
-				for i, expSample := range tt.expected {
-					require.True(t, labels.Equal(expSample.lset, emittedSamples[i].lset), "labels mismatch at index %d: expected %v, got %v", i, expSample.lset, emittedSamples[i].lset)
-					require.Equal(t, expSample.val, emittedSamples[i].val, "value mismatch at index %d", i)
+			for _, suffix := range []string{"", ClassicSuffixBucket, ClassicSuffixCount, ClassicSuffixSum} {
+				var expected []string
+				for _, s := range tt.expected {
+					if strings.HasSuffix(s.lset.Get(model.MetricNameLabel), suffix) {
+						expected = append(expected, fmt.Sprintf("%s %v", s.lset, s.val))
+					}
+				}
+				for _, c := range []*ClassicSeriesCache{nil, cache} {
+					var got []string
+					err := ConvertNHCBToClassic(tt.nhcb, tt.labels, labelBuilder, suffix, c, func(lbls labels.Labels, val float64) error {
+						got = append(got, fmt.Sprintf("%s %v", lbls, val))
+						return nil
+					})
+					if tt.expectErr {
+						require.Error(t, err, "suffix %q, cached %v", suffix, c != nil)
+						continue
+					}
+					require.NoError(t, err, "suffix %q, cached %v", suffix, c != nil)
+					require.Equal(t, expected, got, "suffix %q, cached %v", suffix, c != nil)
 				}
 			}
 		})
 	}
 }
 
-// TestConvertNHCBToClassicHistogram_CacheMatchesNoCache re-runs every case
-// above through a reused ClassicSeriesCache to prove the cached path emits
-// byte-for-byte the same labels and values as the uncached path.
-func TestConvertNHCBToClassicHistogram_CacheMatchesNoCache(t *testing.T) {
-	h := &Histogram{
-		CustomValues:    []float64{1, 2, 3},
-		PositiveBuckets: []int64{10, 20, 30},
-		PositiveSpans:   []Span{{Offset: 0, Length: 3}},
-		Count:           100,
-		Sum:             100.0,
-		Schema:          CustomBucketsSchema,
-	}
-	lset := labels.FromStrings("__name__", "test_metric", "job", "test_job")
-	labelBuilder := labels.NewBuilder(labels.EmptyLabels())
-
-	var without []sample
-	require.NoError(t, ConvertNHCBToClassic(h, lset, labelBuilder, "", nil, func(lbls labels.Labels, val float64) error {
-		without = append(without, sample{lset: lbls, val: val})
-		return nil
-	}))
-
-	cache := &ClassicSeriesCache{}
-	for iteration := range 3 {
-		var with []sample
-		require.NoError(t, ConvertNHCBToClassic(h, lset, labelBuilder, "", cache, func(lbls labels.Labels, val float64) error {
-			with = append(with, sample{lset: lbls, val: val})
-			return nil
-		}))
-		require.Len(t, with, len(without))
-		for i := range without {
-			require.True(t, labels.Equal(without[i].lset, with[i].lset), "iteration %d: labels mismatch at index %d", iteration, i)
-			require.Equal(t, without[i].val, with[i].val, "iteration %d: value mismatch at index %d", iteration, i)
-		}
-	}
-}
-
 // BenchmarkConvertNHCBToClassic simulates the real hot path: the same NHCB
 // series converted once per scrape/timestamp over a query range. with_cache
-// reuses one ClassicSeriesCache across iterations, as storage/nhcb_querier.go
-// does per raw NHCB series; no_cache rebuilds names, le strings and label
-// sets from scratch every call, as the code did before caching.
+// reuses one ClassicSeriesCache across iterations, as the query-time
+// conversion in storage/histogramconv does per native histogram series;
+// no_cache rebuilds names, le strings and label sets from scratch every call,
+// as the code did before caching.
 func BenchmarkConvertNHCBToClassic(b *testing.B) {
 	const numBuckets = 30
 	customValues := make([]float64, numBuckets)
