@@ -253,6 +253,26 @@ func TestQuerier_Stored(t *testing.T) {
 			},
 		},
 		{
+			// The stored series of a classic histogram usually have the
+			// same timestamps. Where they do not, stored data wins at all
+			// of them.
+			name: "stored wins: stored series with different timestamps",
+			series: []storage.Series{
+				storage.NewListSeries(bucket("1"), []chunks.Sample{fSample{t: 2, f: 4}, fSample{t: 4, f: 4}}),
+				storage.NewListSeries(bucket("+Inf"), []chunks.Sample{fSample{t: 3, f: 5}, fSample{t: 4, f: 5}}),
+				storage.NewListSeries(foo, []chunks.Sample{
+					hSample{t: 1, h: nhcb}, hSample{t: 2, h: nhcb}, hSample{t: 3, h: nhcb}, hSample{t: 4, h: nhcb}, hSample{t: 5, h: nhcb},
+				}),
+			},
+			convertFrom: []Representation{NHCB},
+			matchers:    []*labels.Matcher{name("foo_bucket")},
+			expected: []string{
+				`{__name__="foo_bucket", le="+Inf"} 1@1 stale@2 5@3 5@4 1@5`,
+				`{__name__="foo_bucket", le="1"} 4@2 4@4`,
+				`{__name__="foo_bucket", le="1.0"} 1@1 stale@2 1@5`,
+			},
+		},
+		{
 			// E.g. where the scrape loop of the classic histogram marks it
 			// stale after a configuration reload converted it to NHCB. The
 			// next sample of the NHCB might be outside the selected range.
