@@ -511,6 +511,40 @@ func TestConvertExponentialToClassic(t *testing.T) {
 			},
 		},
 		{
+			// Empty buckets within spans, e.g. kept by the TSDB, count as a
+			// gap, too.
+			name: "empty buckets within spans",
+			h: &FloatHistogram{
+				Schema:          0,
+				Count:           4,
+				Sum:             20,
+				PositiveSpans:   []Span{{Offset: 0, Length: 4}},
+				PositiveBuckets: []float64{1, 0, 0, 3}, // (0.5,1] and (4,8].
+			},
+			expected: []sample{
+				bucket("0.5", 0), bucket("1.0", 1), bucket("4.0", 1), bucket("8.0", 4), bucket("+Inf", 4),
+				count(4), sum(20),
+			},
+		},
+		{
+			// The empty bucket (0.25,0.5] lies within the zero bucket, where
+			// a boundary would neither be exact nor ascending.
+			name: "empty bucket within the zero bucket",
+			h: &FloatHistogram{
+				Schema:          0,
+				ZeroThreshold:   0.75,
+				ZeroCount:       1,
+				Count:           4,
+				Sum:             3,
+				PositiveSpans:   []Span{{Offset: -1, Length: 3}},
+				PositiveBuckets: []float64{0, 2, 1}, // (0.25,0.5], (0.5,1] and (1,2].
+			},
+			expected: []sample{
+				bucket("0.75", 1), bucket("1.0", 3), bucket("2.0", 4), bucket("+Inf", 4),
+				count(4), sum(3),
+			},
+		},
+		{
 			name: "negative, zero and positive buckets",
 			h: &FloatHistogram{
 				Schema:          0,

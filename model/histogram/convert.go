@@ -372,14 +372,18 @@ func ConvertExponentialToClassic(nh any, boundaries []float64, lset labels.Label
 // returns the extended slice. The appended boundaries are strictly ascending
 // and do not include +Inf, see ConvertExponentialToClassic.
 //
-// Those are the upper boundaries of all buckets of fh, plus the lower boundary
-// of every bucket that does not directly follow the previous one, i.e. of the
-// lowest bucket and of the first bucket after a gap. The latter keep the linear
-// interpolation of a classic histogram_quantile() within the buckets the
-// observations are in, rather than spreading it across a gap or, for the lowest
-// bucket, down to zero. The lower boundary of a zero bucket that is the lowest
-// bucket is not included, as histogram_quantile() already assumes zero as the
-// lower boundary in that case.
+// Those are the upper boundaries of all buckets of fh with observations, plus
+// the lower boundary of every such bucket that does not directly follow the
+// previous one, i.e. of the lowest one and of the first one after a gap. The
+// latter keep the linear interpolation of a classic histogram_quantile()
+// within the buckets the observations are in, rather than spreading it across
+// a gap or, for the lowest bucket, down to zero. The lower boundary of a zero
+// bucket that is the lowest bucket is not included, as histogram_quantile()
+// already assumes zero as the lower boundary in that case.
+//
+// Empty buckets count as a gap, so that the boundaries do not depend on the
+// spans of fh, which can hold empty buckets, e.g. in the TSDB, and so that
+// empty buckets within the zero bucket do not add boundaries.
 func AppendClassicBoundaries(dst []float64, fh *FloatHistogram) []float64 {
 	var (
 		prevUpper float64
@@ -387,6 +391,9 @@ func AppendClassicBoundaries(dst []float64, fh *FloatHistogram) []float64 {
 	)
 	for it := fh.AllBucketIterator(); it.Next(); {
 		b := it.At()
+		if b.Count == 0 {
+			continue
+		}
 		if lowerBoundaryNeeded(b, lowest, prevUpper) {
 			dst = append(dst, b.Lower)
 		}
