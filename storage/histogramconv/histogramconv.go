@@ -32,7 +32,11 @@ const (
 	// representations to convert from. Its matchers are matched against the
 	// representations, e.g. foo_bucket{__convert_stored_as__="nhcb"} only
 	// returns the classic histogram series converted from NHCB. Several
-	// matchers must all match, as for other labels.
+	// matchers must all match, as for other labels. Matchers that match the
+	// empty value, but none of the representations, e.g.
+	// foo_bucket{__convert_stored_as__=""}, turn the conversion off: the
+	// selector returns the stored series as they are, as if query-time
+	// histogram conversion were disabled.
 	ConvertStoredAsLabel = "__convert_stored_as__"
 	// DebugStoredAsLabel is the control label that adds StoredAsLabel to the
 	// returned series if all its matchers match "true", e.g.

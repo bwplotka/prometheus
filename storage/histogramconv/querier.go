@@ -47,9 +47,11 @@ import (
 //
 // Matchers on the ConvertStoredAsLabel override convertFrom per selector, and
 // select the representations of the stored samples to return, too. Matchers
-// on the DebugStoredAsLabel that match "true" add the StoredAsLabel to the
-// returned series. Both are removed before selecting from the wrapped
-// querier.
+// on it that match the empty value, but none of the representations, e.g.
+// __convert_stored_as__="", turn the conversion off for the selector, which
+// then returns the stored series as they are. Matchers on the
+// DebugStoredAsLabel that match "true" add the StoredAsLabel to the returned
+// series. Both are removed before selecting from the wrapped querier.
 //
 // Known limitations:
 //

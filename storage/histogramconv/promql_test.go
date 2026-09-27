@@ -49,6 +49,10 @@ eval instant at 2m rpc_latency_seconds
 eval instant at 2m rpc_latency_seconds_count{__convert_stored_as__="classic"}
 
 eval instant at 2m rpc_latency_seconds_count{__debug_stored_as__="true"}
+
+# So the empty value returns the stored series, as it does with the feature.
+eval instant at 2m rpc_latency_seconds_count{__convert_stored_as__=""}
+	rpc_latency_seconds_count{job="b"} 4
 `,
 		},
 		{
@@ -287,6 +291,14 @@ eval instant at 2m rpc_latency_seconds_count
 # Stored series only.
 eval instant at 2m rpc_latency_seconds_count{__convert_stored_as__="classic"}
 	rpc_latency_seconds_count{job="classic"} 4
+
+# Stored series as they are, as if the feature were disabled.
+eval instant at 2m rpc_latency_seconds_count{__convert_stored_as__=""}
+	rpc_latency_seconds_count{job="classic"} 4
+
+# Debug still adds __stored_as__, but nothing is converted.
+eval instant at 2m rpc_latency_seconds_count{__convert_stored_as__="", __debug_stored_as__="true"}
+	rpc_latency_seconds_count{job="classic", __stored_as__="classic"} 4
 
 # Stored series, plus the series converted from NHCB.
 eval instant at 2m rpc_latency_seconds_count{__convert_stored_as__=~"classic|nhcb"}
@@ -857,6 +869,14 @@ eval range from 0 to 9m step 1m histogram_count(foo)
 eval range from 3m to 6m step 1m foo_count{__debug_stored_as__="true"}
 	foo_count{job="a", __stored_as__="classic"} 6 8 _ _
 	foo_count{job="a", __stored_as__="nhcb"} _ _ 10 12
+
+# The empty value turns the conversion off, so each selector only returns what
+# is stored in its form.
+eval range from 0 to 9m step 1m foo_count{__convert_stored_as__=""}
+	foo_count{job="a"} 0 2 4 6 8 _ _ _ _ _
+
+eval range from 0 to 9m step 1m histogram_count(foo{__convert_stored_as__=""})
+	{job="a"} _ _ _ _ _ 10 12 14 16 18
 `,
 		},
 		{

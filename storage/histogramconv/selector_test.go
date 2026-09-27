@@ -198,6 +198,32 @@ func TestNewSelector(t *testing.T) {
 			stored:           []Representation{},
 		},
 		{
+			name:             "empty convert matcher turns the conversion off",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo_bucket"), convert(labels.MatchEqual, "")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__name__="foo_bucket"`},
+		},
+		{
+			name:             "convert matcher matching the empty value but no representation turns the conversion off",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo"), convert(labels.MatchNotRegexp, ".+")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__name__="foo"`},
+		},
+		{
+			name:             "empty convert matcher with debug",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo_bucket"), convert(labels.MatchEqual, ""), debug(labels.MatchEqual, "true")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__name__="foo_bucket"`},
+			debug:            true,
+		},
+		{
+			name:             "all convert matchers must match the empty value to turn the conversion off",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo"), convert(labels.MatchEqual, ""), convert(labels.MatchEqual, "nhcb")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__name__="foo"`},
+			stored:           []Representation{},
+		},
+		{
 			name:             "convert matcher without a name matcher",
 			matchers:         []*labels.Matcher{job, convert(labels.MatchEqual, "classic")},
 			convertFrom:      all,

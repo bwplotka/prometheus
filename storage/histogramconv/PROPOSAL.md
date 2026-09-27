@@ -163,6 +163,7 @@ Control labels have a precedent in the scrape configuration: relabeling can set 
 |---|---|
 | `foo_bucket` | Stored series, plus the conversions of `--query.convert-histograms-from`. |
 | `foo_bucket{__convert_stored_as__="classic"}` | Stored series only. |
+| `foo_bucket{__convert_stored_as__=""}` | Stored series as they are, as if the feature were disabled. |
 | `foo_bucket{__convert_stored_as__=~"classic\|nhcb"}` | Stored series, plus the series converted from NHCB. |
 | `foo_bucket{__convert_stored_as__="nhcb"}` | Only the series converted from NHCB. |
 | `foo{__convert_stored_as__=~"nhcb\|nhe"}` | Stored native histograms only. |
@@ -178,9 +179,12 @@ The rules:
 2. With one, a selector returns the samples of each representation the matcher matches, stored or converted, even if
    the flag does not list it. Float samples are `classic`, native histograms with custom buckets `nhcb` and those with
    exponential buckets `nhe`, and converted samples have the representation they were converted from. Several
-   matchers on the label must all match, as for other labels, and a matcher that matches none of the representations
-   selects nothing. Where a stored series changes to a representation the selector does not read, it gets a
-   staleness marker, like a converted series whose source changes.
+   matchers on the label must all match, as for other labels. Matchers that match the empty value, but none of the
+   representations, e.g. `__convert_stored_as__=""`, turn the conversion off: the selector returns the stored series
+   as they are, as it does where the feature is disabled. That is a safe way to rule out the conversion for a
+   selector, e.g. when debugging a query. Other matchers that match none of the representations select nothing.
+   Where a stored series changes to a representation the selector does not read, it gets a staleness marker, like a
+   converted series whose source changes.
 3. With `__debug_stored_as__="true"`, the value of `__stored_as__` is the representation of the samples of the series,
    so a stored series whose samples change representation, e.g. from `nhcb` to `nhe`, is split in two. Otherwise,
    converted series look exactly like stored ones, and are merged with them, see
@@ -207,10 +211,11 @@ clause, e.g. `histogram_quantile(0.9, sum by (le, __stored_as__) (rate(foo_bucke
 and a binary operation with debug on one side only matches with `ignoring(__stored_as__)`, as for any label that
 only one side has.
 
-Control labels do not degrade gracefully, though. Where the feature is disabled, and in the metadata APIs, no series
-has them, so selectors with `__convert_stored_as__` or `__debug_stored_as__` matchers return nothing. That is
-acceptable for an experimental feature. A virtual label that only converted series have would keep its meaning
-there, see the [alternatives](#alternatives).
+Control labels mostly do not degrade gracefully, though. Where the feature is disabled, and in the metadata APIs, no
+series has them, so selectors with `__convert_stored_as__` or `__debug_stored_as__` matchers return nothing, except
+for `__convert_stored_as__=""`, which returns the stored series either way. That is acceptable for an experimental
+feature. A virtual label that only converted series have would keep its meaning there, see the
+[alternatives](#alternatives).
 
 ### Histograms stored in both representations
 

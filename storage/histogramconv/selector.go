@@ -75,9 +75,11 @@ func (sel selector) passThrough() bool {
 // removed from the matchers. The representations that match all
 // ConvertStoredAsLabel matchers are both the representations of the stored
 // samples to return and the ones to convert from. Without such matchers, all
-// stored samples are returned. The StoredAsLabel is added to the returned
-// series if there are DebugStoredAsLabel matchers, and all of them match
-// "true".
+// stored samples are returned. If they match the empty value, but none of the
+// representations, e.g. __convert_stored_as__="", nothing is converted and
+// all stored samples are returned, as without query-time histogram
+// conversion. The StoredAsLabel is added to the returned series if there are
+// DebugStoredAsLabel matchers, and all of them match "true".
 //
 // Only selectors with a single metric name matcher, which has to be an
 // equality matcher, are converted:
@@ -112,6 +114,11 @@ func newSelector(matchers []*labels.Matcher, convertFrom representations) (selec
 		if len(convertMatchers) > 0 {
 			sel.stored = matchingRepresentations(convertMatchers)
 			convertFrom = sel.stored
+			if sel.stored == 0 && !slices.ContainsFunc(convertMatchers, func(m *labels.Matcher) bool { return !m.Matches("") }) {
+				// The conversion is turned off, and the stored samples are
+				// returned as they are.
+				sel.stored = allRepresentations
+			}
 		}
 		sel.debug = len(debugMatchers) > 0 && !slices.ContainsFunc(debugMatchers, func(m *labels.Matcher) bool { return !m.Matches("true") })
 	}

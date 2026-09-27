@@ -439,10 +439,12 @@ the storage, and returned series never have them:
   converted, overriding `--query.convert-histograms-from`. It is matched against `classic`, `nhcb`
   and `nhe`: float samples are `classic`, native histograms with custom buckets `nhcb`, and those
   with exponential buckets `nhe`, and converted samples have the representation they were
-  converted from. Several matchers must all match, and a matcher that matches none of the
-  representations selects nothing. Where a stored series changes to a representation the selector
-  does not read, it is marked stale. Stored data the selector does not read does not win over
-  converted data.
+  converted from. Several matchers must all match. `__convert_stored_as__=""`, or any matchers
+  that match the empty value but none of the representations, turn the conversion off for the
+  selector: it returns the stored series as they are, as if the feature were disabled. Other
+  matchers that match none of the representations select nothing. Where a stored series changes
+  to a representation the selector does not read, it is marked stale. Stored data the selector
+  does not read does not win over converted data.
 * `__debug_stored_as__="true"` adds a `__stored_as__` label to the returned series, holding the
   representation their samples are stored as. A stored series whose samples change representation
   is split into one series per representation. Stored and converted series are not merged then,
@@ -456,6 +458,7 @@ For example, with `--query.convert-histograms-from=nhcb`:
 |---|---|
 | `foo_bucket` | Stored series, plus the series converted from NHCB. |
 | `foo_bucket{__convert_stored_as__="classic"}` | Stored series only. |
+| `foo_bucket{__convert_stored_as__=""}` | Stored series as they are, as if the feature were disabled. |
 | `foo_bucket{__convert_stored_as__="nhcb"}` | Only the series converted from NHCB. |
 | `foo_bucket{__convert_stored_as__="nhe"}` | Only the series converted from exponential histograms. |
 | `foo{__convert_stored_as__="nhe"}` | Stored exponential histograms only. |
@@ -463,8 +466,10 @@ For example, with `--query.convert-histograms-from=nhcb`:
 | `foo_bucket{__convert_stored_as__=~".*", __debug_stored_as__="true"}` | Stored series, plus the series converted from every representation, with `__stored_as__`. |
 
 As for any selector, at least one matcher besides the control matchers must not match the empty
-value. Where the feature is disabled, or `--query.convert-histograms-from` is empty, selectors with
-control matchers select nothing.
+value. Where the feature is disabled, or `--query.convert-histograms-from` is empty, no series has
+the control labels: `__convert_stored_as__=""` returns the stored series, as it does with the
+feature, and control matchers that do not match the empty value, e.g. `__convert_stored_as__="nhcb"`
+or `__debug_stored_as__="true"`, select nothing.
 
 Unlike NHCB, native histograms with an exponential schema have no fixed bucket boundaries. So that
 the converted `_bucket` series can be aggregated across series and over time, e.g. with
