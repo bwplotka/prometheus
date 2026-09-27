@@ -323,6 +323,29 @@ func TestQuerier_Stored(t *testing.T) {
 			},
 		},
 		{
+			// The converted staleness marker at t=2 would be the first
+			// sample, the one at t=5 would follow the one that replaces the
+			// dropped sample at t=4.
+			name: "stored wins: no leading or consecutive staleness markers",
+			series: []storage.Series{
+				storage.NewListSeries(fooCount, []chunks.Sample{fSample{t: 1, f: 5}, fSample{t: 4, f: 5}}),
+				storage.NewListSeries(foo, []chunks.Sample{
+					hSample{t: 1, h: nhcb},
+					hSample{t: 2, h: staleHistogram},
+					hSample{t: 3, h: nhcb},
+					hSample{t: 4, h: nhcb},
+					hSample{t: 5, h: staleHistogram},
+					hSample{t: 6, h: nhcb},
+				}),
+			},
+			convertFrom: []Representation{NHCB},
+			matchers:    []*labels.Matcher{name("foo_count"), debug},
+			expected: []string{
+				`{__name__="foo_count", __stored_as__="classic"} 5@1 5@4`,
+				`{__name__="foo_count", __stored_as__="nhcb"} 1@3 stale@4 1@6`,
+			},
+		},
+		{
 			// E.g. a float series named like the base name of a classic
 			// histogram.
 			name: "stored wins: series with the same labels are merged in debug mode, too",

@@ -275,7 +275,9 @@ func (h *indexedHistogram) addTimestamps(ts []int64) {
 
 // shadow drops the samples at the sorted timestamps ts. Where the sample
 // before a dropped one is returned, and not a staleness marker, it returns a
-// staleness marker instead of the dropped sample. It reuses samples.
+// staleness marker instead of the dropped sample. It also drops the staleness
+// markers that would be returned first or right after another staleness
+// marker. It reuses samples.
 func shadow(samples []chunks.Sample, ts []int64) []chunks.Sample {
 	if len(ts) == 0 {
 		return samples
@@ -288,7 +290,9 @@ func shadow(samples []chunks.Sample, ts []int64) []chunks.Sample {
 			j++
 		}
 		if j == len(ts) || ts[j] != t {
-			out = append(out, smpl)
+			if !isStale(smpl) || (len(out) > 0 && !isStale(out[len(out)-1])) {
+				out = append(out, smpl)
+			}
 			continue
 		}
 		if len(out) > 0 && !isStale(out[len(out)-1]) {
