@@ -2,7 +2,7 @@
 
 * **Owners:**
   * Bartłomiej (Bartek) Płotka (@bwplotka)
-  * @rbizos
+  * Raphael Bizos (@rbizos)
 
 * **Implementation Status:** Implemented behind the `promql-histogram-conversion` feature flag on the
   `histogram-promql` branch, except the follow-ups in the [action plan](#action-plan).
