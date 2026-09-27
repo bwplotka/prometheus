@@ -373,14 +373,21 @@ func TestQuerier_Stored(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			q := NewQuerier(storedQuerier(tc.series...), tc.convertFrom)
-			ss := q.Select(context.Background(), false, nil, tc.matchers...)
-			if tc.err != nil {
-				require.False(t, ss.Next())
-				require.ErrorIs(t, ss.Err(), tc.err)
-				return
+			for _, inner := range []storage.Querier{
+				storedQuerier(tc.series...),
+				// The fanout storage merges remote read storage like this.
+				// Such a secondary querier panics if Select is called after
+				// the first Next of any series set it returned.
+				storage.NewMergeQuerier(nil, []storage.Querier{storedQuerier(tc.series...)}, storage.ChainedSeriesMerge),
+			} {
+				ss := NewQuerier(inner, tc.convertFrom).Select(context.Background(), false, nil, tc.matchers...)
+				if tc.err != nil {
+					require.False(t, ss.Next())
+					require.ErrorIs(t, ss.Err(), tc.err)
+					continue
+				}
+				require.ElementsMatch(t, tc.expected, samplesSummary(t, ss))
 			}
-			require.ElementsMatch(t, tc.expected, samplesSummary(t, ss))
 		})
 	}
 }

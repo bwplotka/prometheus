@@ -75,13 +75,9 @@ func (s *seriesSet) storedWins(stored, converted []*series) ([]*series, error) {
 		ts  []int64
 		err error
 	)
-	if len(s.sel.leMatchers) > 0 {
+	if ss := s.allBucketsSet; ss != nil {
 		// The stored series of a histogram can have other le values than the
-		// converted ones, e.g. than those converted from exponential
-		// histograms, so they are selected without the le matchers.
-		ss := s.q.Select(s.ctx, false, s.hints, slices.DeleteFunc(slices.Clone(s.sel.matchers), func(m *labels.Matcher) bool {
-			return m.Name == labels.BucketLabel
-		})...)
+		// converted ones, see Select.
 		for ss.Next() {
 			h := idx.get(ss.At().Labels())
 			if h == nil {

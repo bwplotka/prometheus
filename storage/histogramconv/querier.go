@@ -55,8 +55,9 @@ import (
 //
 // Known limitations:
 //
-//   - Only Select converts. LabelNames and LabelValues return stored data
-//     only.
+//   - Only Select converts, and only the PromQL engine uses the querier, see
+//     promql.EngineOpts.HistogramConversionFrom. LabelNames, LabelValues and
+//     other APIs, e.g. the remote read endpoint, return stored data only.
 //   - Stored data only wins at the exact timestamps of its samples. Where a
 //     histogram is stored in both representations at different timestamps,
 //     e.g. ingested from different sources, the merged series alternates
@@ -64,6 +65,9 @@ import (
 //   - Converted series, and stored series whose samples are filtered by
 //     representation, are buffered in memory before the first one is
 //     returned.
+//   - A selector for classic histogram series with le matchers that converts
+//     from native histograms also selects the stored series without the le
+//     matchers, even if nothing is converted, see Select.
 func NewQuerier(q storage.Querier, convertFrom []Representation) storage.Querier {
 	return &querier{Querier: q, convertFrom: newRepresentations(convertFrom...)}
 }
@@ -74,7 +78,11 @@ type querier struct {
 	convertFrom representations
 }
 
-// Select implements the storage.Querier interface.
+// Select implements the storage.Querier interface. It selects all the series
+// it might need from the wrapped querier before it returns, and reads them on
+// the first call of Next of the returned series set, as queriers that merge
+// remote read storage panic if Select is called after that, see
+// storage.NewMergeQuerier.
 func (q *querier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	sel, err := newSelector(matchers, q.convertFrom)
 	switch {
@@ -85,7 +93,21 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, hints *storage.Se
 	case sel.passThrough():
 		return q.Querier.Select(ctx, sortSeries, hints, sel.matchers...)
 	}
-	return &seriesSet{ctx: ctx, q: q.Querier, hints: hints, sel: sel}
+	s := &seriesSet{sel: sel, storedSet: q.Querier.Select(ctx, false, hints, sel.matchers...)}
+	if sel.from == 0 {
+		return s
+	}
+	s.sourceSet = q.Querier.Select(ctx, false, hints, sel.sourceMatchers...)
+	if len(sel.leMatchers) > 0 {
+		// The stored series of a histogram can have other le values than the
+		// converted ones, e.g. than those converted from exponential
+		// histograms, so the timestamps where stored data wins are read from
+		// all of them, if anything is converted.
+		s.allBucketsSet = q.Querier.Select(ctx, false, hints, slices.DeleteFunc(slices.Clone(sel.matchers), func(m *labels.Matcher) bool {
+			return m.Name == labels.BucketLabel
+		})...)
+	}
+	return s
 }
 
 // series is a series returned by a seriesSet: a converted series, a stored
@@ -108,14 +130,16 @@ func (s *series) storageSeries() storage.Series {
 }
 
 // seriesSet returns the stored and the converted series of a selector, sorted
-// by labels. It selects and converts them on the first call of Next, as the
+// by labels. It reads and converts them on the first call of Next, as the
 // samples of all the series to convert from are needed to convert any of
 // them.
 type seriesSet struct {
-	ctx   context.Context
-	q     storage.Querier
-	hints *storage.SelectHints
-	sel   selector
+	sel selector
+	// storedSet holds the stored series the selector reads, and sourceSet
+	// the series to convert from, nil if nothing is converted. allBucketsSet
+	// holds the stored series the selector reads without its le matchers,
+	// nil if it has none, see Select.
+	storedSet, sourceSet, allBucketsSet storage.SeriesSet
 
 	// it, h and fh are reused to read the samples of stored series.
 	it chunkenc.Iterator
@@ -152,15 +176,15 @@ func (s *seriesSet) Err() error { return s.err }
 
 func (s *seriesSet) Warnings() annotations.Annotations { return s.warnings }
 
-// load selects the stored series and the ones to convert from, converts them,
+// load reads the stored series and the ones to convert from, converts them,
 // and lets the stored data win.
 func (s *seriesSet) load() ([]storage.Series, error) {
-	stored, err := s.selectStored()
+	stored, err := s.readStored()
 	if err != nil {
 		return nil, err
 	}
 	var converted []*series
-	if s.sel.from != 0 {
+	if s.sourceSet != nil {
 		if converted, err = s.convert(); err != nil {
 			return nil, err
 		}
@@ -184,12 +208,12 @@ func (s *seriesSet) load() ([]storage.Series, error) {
 	return out, nil
 }
 
-// selectStored returns the stored series the selector reads. Unless their
+// readStored returns the stored series the selector reads. Unless their
 // samples are filtered by representation, they are returned unchanged.
-func (s *seriesSet) selectStored() ([]*series, error) {
+func (s *seriesSet) readStored() ([]*series, error) {
 	var (
 		out    []*series
-		ss     = s.q.Select(s.ctx, false, s.hints, s.sel.matchers...)
+		ss     = s.storedSet
 		filter = s.sel.stored != allRepresentations || s.sel.debug
 		split  = storedSplitter{stored: s.sel.stored, debug: s.sel.debug}
 	)
@@ -208,20 +232,19 @@ func (s *seriesSet) selectStored() ([]*series, error) {
 	return out, ss.Err()
 }
 
-// convert selects the series to convert from, and converts them.
+// convert converts the series to convert from.
 func (s *seriesSet) convert() ([]*series, error) {
 	var (
-		sources   = s.q.Select(s.ctx, false, s.hints, s.sel.sourceMatchers...)
 		converted []*series
 		err       error
 	)
 	if s.sel.suffix != "" {
-		converted, err = toClassic(sources, s.sel.suffix, s.sel.from, s.sel.leMatchers, s.sel.debug)
+		converted, err = toClassic(s.sourceSet, s.sel.suffix, s.sel.from, s.sel.leMatchers, s.sel.debug)
 	} else {
 		var ws annotations.Annotations
-		converted, ws, err = toNHCB(sources, s.sel.debug)
+		converted, ws, err = toNHCB(s.sourceSet, s.sel.debug)
 		s.warnings.Merge(ws)
 	}
-	s.warnings.Merge(sources.Warnings())
+	s.warnings.Merge(s.sourceSet.Warnings())
 	return converted, err
 }
