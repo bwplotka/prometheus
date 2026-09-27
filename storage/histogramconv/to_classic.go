@@ -42,6 +42,8 @@ import (
 // histogram that does not result in it anymore, e.g. because the native
 // histogram went stale, its bucket layout changed or it is not converted, just
 // like the scrape loop marks series stale that disappear from a target.
+// Converted samples other than staleness markers have the start timestamp of
+// the native histogram sample they were converted from.
 func toClassic(ss storage.SeriesSet, suffix string, from representations, leMatchers []*labels.Matcher, debug bool) ([]*series, error) {
 	nhSeries, err := readNativeHistograms(ss, from)
 	if err != nil {
@@ -69,7 +71,7 @@ func toClassic(ss storage.SeriesSet, suffix string, from representations, leMatc
 		}
 		b.startSeries()
 		for _, smpl := range ns.samples {
-			b.startSample(smpl.t)
+			b.startSample(smpl.st, smpl.t)
 			if smpl.fh != nil {
 				var err error
 				if histogram.IsExponentialSchema(smpl.fh.Schema) {
@@ -104,12 +106,12 @@ type nativeHistogramSeries struct {
 	samples []nativeHistogramSample
 }
 
-// nativeHistogramSample is a sample of a native histogram series. fh is the
-// histogram to convert, nil if the sample is not converted, e.g. a staleness
-// marker.
+// nativeHistogramSample is a sample of a native histogram series, with its
+// start timestamp st. fh is the histogram to convert, nil if the sample is not
+// converted, e.g. a staleness marker.
 type nativeHistogramSample struct {
-	t  int64
-	fh *histogram.FloatHistogram
+	st, t int64
+	fh    *histogram.FloatHistogram
 }
 
 // readNativeHistograms drains ss and returns its series. Only the native
@@ -124,7 +126,7 @@ func readNativeHistograms(ss storage.SeriesSet, from representations) ([]nativeH
 		ns := nativeHistogramSeries{labels: s.Labels()}
 		it = s.Iterator(it)
 		for valType := it.Next(); valType != chunkenc.ValNone; valType = it.Next() {
-			smpl := nativeHistogramSample{t: it.AtT()}
+			smpl := nativeHistogramSample{st: it.AtST(), t: it.AtT()}
 			if valType == chunkenc.ValHistogram || valType == chunkenc.ValFloatHistogram {
 				// This works for histograms with integer counts, too.
 				if _, fh := it.AtFloatHistogram(nil); convertible(fh, from) {
@@ -202,8 +204,9 @@ type classicSeriesBuilder struct {
 	// byHash indexes series by label hash rather than by Labels.String().
 	byHash map[uint64][]int
 
-	// t is the timestamp of the current sample.
-	t int64
+	// st and t are the start timestamp and the timestamp of the current
+	// sample.
+	st, t int64
 	// emitted and prevEmitted are the indices of the series emitted for the
 	// current and for the previous sample of the current native histogram.
 	emitted, prevEmitted []int
@@ -218,14 +221,16 @@ func (b *classicSeriesBuilder) startSeries() {
 	b.prevEmitted = b.prevEmitted[:0]
 }
 
-// startSample prepares for the series converted from the sample at t.
-func (b *classicSeriesBuilder) startSample(t int64) {
-	b.t = t
+// startSample prepares for the series converted from the sample at t, with
+// the start timestamp st.
+func (b *classicSeriesBuilder) startSample(st, t int64) {
+	b.st, b.t = st, t
 	b.emitted = b.emitted[:0]
 }
 
-// emit appends the value v at the timestamp of the current sample to the series
-// with labels l. It is the emitSeriesFn of the conversion functions.
+// emit appends the value v at the timestamp of the current sample, with its
+// start timestamp, to the series with labels l. It is the emitSeriesFn of the
+// conversion functions.
 func (b *classicSeriesBuilder) emit(l labels.Labels, v float64) error {
 	h := l.Hash()
 	idx := -1
@@ -241,7 +246,7 @@ func (b *classicSeriesBuilder) emit(l labels.Labels, v float64) error {
 		b.series = append(b.series, &series{lset: l})
 	}
 
-	b.series[idx].samples = append(b.series[idx].samples, fSample{t: b.t, f: v})
+	b.series[idx].samples = append(b.series[idx].samples, fSample{st: b.st, t: b.t, f: v})
 	b.emitted = append(b.emitted, idx)
 	return nil
 }

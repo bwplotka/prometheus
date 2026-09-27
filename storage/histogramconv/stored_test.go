@@ -206,6 +206,27 @@ func TestQuerier_Stored(t *testing.T) {
 			expected: []string{`{__name__="foo"} 1@2(st=1) {count:1, sum:1, [-Inf,1]:1}@3(st=1) {count:1, sum:1, (0.5,1]:1}@4(st=1)`},
 		},
 		{
+			name: "start timestamps are kept in series converted to classic histograms",
+			series: []storage.Series{storage.NewListSeries(foo, []chunks.Sample{
+				hSample{st: 1, t: 2, h: nhcb}, fhSample{st: 1, t: 3, fh: nhe.ToFloat(nil)}, hSample{t: 4, h: staleHistogram},
+			})},
+			convertFrom: []Representation{NHCB, NHE},
+			matchers:    []*labels.Matcher{name("foo_count")},
+			expected:    []string{`{__name__="foo_count"} 1@2(st=1) 1@3(st=1) stale@4`},
+		},
+		{
+			// The start timestamp changes at t=4, e.g. because the target
+			// restarted.
+			name: "start timestamps are kept in series converted to NHCB",
+			series: []storage.Series{
+				storage.NewListSeries(bucket("+Inf"), []chunks.Sample{fSample{st: 1, t: 2, f: 2}, fSample{st: 3, t: 4, f: 1}}),
+				storage.NewListSeries(fooCount, []chunks.Sample{fSample{st: 1, t: 2, f: 2}, fSample{st: 3, t: 4, f: 1}}),
+			},
+			convertFrom: []Representation{Classic},
+			matchers:    []*labels.Matcher{name("foo")},
+			expected:    []string{`{__name__="foo"} {count:2, sum:0, [-Inf,+Inf]:2}@2(st=1) {count:1, sum:0, [-Inf,+Inf]:1}@4(st=3)`},
+		},
+		{
 			name: "series converted to classic histograms in debug mode",
 			series: []storage.Series{storage.NewListSeries(foo, []chunks.Sample{
 				hSample{t: 1, h: nhcb}, hSample{t: 2, h: nhe},

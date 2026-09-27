@@ -41,9 +41,17 @@ var errMalformedBucketLabel = errors.New("malformed bucket label")
 type nhcbGroup struct {
 	labels     labels.Labels
 	name       string
-	histograms map[int64]*convertnhcb.TempHistogram
+	histograms map[int64]*classicHistogram
 	// stale holds the timestamps of the stale markers of the classic series.
 	stale map[int64]struct{}
+}
+
+// classicHistogram collects the samples of the classic histogram series of a
+// group at one timestamp.
+type classicHistogram struct {
+	convertnhcb.TempHistogram
+	// st is the latest start timestamp of the samples.
+	st int64
 }
 
 // toNHCB converts the classic histogram series (_bucket, _count and _sum) of
@@ -54,7 +62,9 @@ type nhcbGroup struct {
 //
 // The NHCB is marked stale where all of its classic series are, e.g. because
 // the target went away. Otherwise the remaining series are converted, e.g.
-// because the bucket layout changed.
+// because the bucket layout changed. Converted samples other than staleness
+// markers have the latest start timestamp of the classic histogram samples
+// they were converted from.
 func toNHCB(ss storage.SeriesSet, debug bool) ([]*series, annotations.Annotations, error) {
 	var (
 		groups   []*nhcbGroup
@@ -97,10 +107,13 @@ func toNHCB(ss storage.SeriesSet, debug bool) ([]*series, annotations.Annotation
 			}
 			temp, ok := group.histograms[t]
 			if !ok {
-				h := convertnhcb.NewTempHistogram()
-				temp = &h
+				temp = &classicHistogram{TempHistogram: convertnhcb.NewTempHistogram()}
 				group.histograms[t] = temp
 			}
+			// The series of a classic histogram usually have the same start
+			// timestamp. Where they do not, the NHCB gets the latest one, as
+			// all of them count from there.
+			temp.st = max(temp.st, it.AtST())
 			switch suffixType {
 			case convertnhcb.SuffixBucket:
 				_ = temp.SetBucketCount(le, v)
@@ -149,9 +162,9 @@ func toNHCB(ss storage.SeriesSet, debug bool) ([]*series, annotations.Annotation
 			}
 			switch {
 			case h != nil:
-				samples = append(samples, hSample{t: t, h: h})
+				samples = append(samples, hSample{st: temp.st, t: t, h: h})
 			case fh != nil:
-				samples = append(samples, fhSample{t: t, fh: fh})
+				samples = append(samples, fhSample{st: temp.st, t: t, fh: fh})
 			}
 		}
 		if len(samples) == 0 {
@@ -178,7 +191,7 @@ func lookupOrCreateGroup(groups *[]*nhcbGroup, byHash map[uint64][]int, lset lab
 	group := &nhcbGroup{
 		labels:     lset,
 		name:       name,
-		histograms: make(map[int64]*convertnhcb.TempHistogram),
+		histograms: make(map[int64]*classicHistogram),
 		stale:      make(map[int64]struct{}),
 	}
 	byHash[h] = append(byHash[h], len(*groups))
