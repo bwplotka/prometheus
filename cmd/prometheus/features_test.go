@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 
+	"github.com/prometheus/prometheus/storage/histogramconv"
 	"github.com/prometheus/prometheus/util/testutil"
 )
 
@@ -129,4 +130,59 @@ func TestSetFeatureListOptions_MetadataWALRecords(t *testing.T) {
 	require.True(t, c.scrape.AppendMetadata)
 	require.True(t, c.web.AppendMetadata)
 	require.True(t, c.tsdb.EnableMetadataWALRecords)
+}
+
+func TestSetFeatureListOptions_HistogramConversion(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		features              []string
+		convertHistogramsFrom []string
+
+		expectedEnabled bool
+		expectedFrom    []histogramconv.Representation
+		expectedErr     string
+	}{
+		{
+			name: "disabled",
+		},
+		{
+			name:            "enabled without representations to convert from",
+			features:        []string{"promql-histogram-conversion"},
+			expectedEnabled: true,
+		},
+		{
+			name:                  "comma separated and repeated representations",
+			features:              []string{"promql-histogram-conversion"},
+			convertHistogramsFrom: []string{"nhcb,classic", "nhe", "nhcb"},
+			expectedEnabled:       true,
+			expectedFrom:          []histogramconv.Representation{histogramconv.NHCB, histogramconv.Classic, histogramconv.NHE},
+		},
+		{
+			name:                  "empty value",
+			convertHistogramsFrom: []string{""},
+		},
+		{
+			name:                  "representations without the feature",
+			convertHistogramsFrom: []string{"nhcb"},
+			expectedErr:           "--query.convert-histograms-from requires --enable-feature=promql-histogram-conversion",
+		},
+		{
+			name:                  "unknown representation",
+			features:              []string{"promql-histogram-conversion"},
+			convertHistogramsFrom: []string{"nhcb,nh"},
+			expectedErr:           `unknown histogram representation "nh"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &flagConfig{featureList: tc.features, convertHistogramsFrom: tc.convertHistogramsFrom}
+			err := c.setFeatureListOptions(promslog.NewNopLogger())
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, err, tc.expectedErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedEnabled, c.enableHistogramConversion)
+			require.Equal(t, tc.expectedFrom, c.histogramConversionFrom)
+		})
+	}
 }

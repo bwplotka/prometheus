@@ -48,6 +48,7 @@ import (
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/schema"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/storage/histogramconv"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/prometheus/prometheus/util/features"
@@ -355,6 +356,15 @@ type EngineOpts struct {
 	// UseStartTimestamps enables start timestamp usage in functions such as rate().
 	UseStartTimestamps bool
 
+	// HistogramConversionFrom holds the histogram representations to convert
+	// from at query time, e.g. so that selectors for classic histogram series
+	// also return the classic histogram series converted from native
+	// histograms, see the histogramconv package. It also enables the control
+	// matchers of that package, e.g. __convert_stored_as__, which override it
+	// per selector. Query-time histogram conversion is disabled if it is
+	// empty.
+	HistogramConversionFrom []histogramconv.Representation
+
 	// FeatureRegistry is the registry for tracking enabled/disabled features.
 	FeatureRegistry features.Collector
 
@@ -380,6 +390,7 @@ type Engine struct {
 	enableDelayedNameRemoval bool
 	enableTypeAndUnitLabels  bool
 	useStartTimestamps       bool
+	histogramConversionFrom  []histogramconv.Representation
 	parser                   parser.Parser
 }
 
@@ -495,6 +506,7 @@ func NewEngine(opts EngineOpts) *Engine {
 		r.Set(features.PromQL, "per_step_stats", opts.EnablePerStepStats)
 		r.Set(features.PromQL, "delayed_name_removal", opts.EnableDelayedNameRemoval)
 		r.Set(features.PromQL, "type_and_unit_labels", opts.EnableTypeAndUnitLabels)
+		r.Set(features.PromQL, "histogram_conversion", len(opts.HistogramConversionFrom) > 0)
 		r.Enable(features.PromQL, "per_query_lookback_delta")
 		r.Enable(features.PromQL, "subqueries")
 
@@ -517,6 +529,7 @@ func NewEngine(opts EngineOpts) *Engine {
 		enableDelayedNameRemoval: opts.EnableDelayedNameRemoval,
 		enableTypeAndUnitLabels:  opts.EnableTypeAndUnitLabels,
 		useStartTimestamps:       opts.UseStartTimestamps,
+		histogramConversionFrom:  opts.HistogramConversionFrom,
 		parser:                   opts.Parser,
 	}
 }
@@ -826,6 +839,9 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 	}
 	querierSpan.End()
 	defer querier.Close()
+	if len(ng.histogramConversionFrom) > 0 {
+		querier = histogramconv.NewQuerier(querier, ng.histogramConversionFrom)
+	}
 
 	ng.populateSeries(ctxPrepare, querier, s)
 	prepareSpanTimer.Finish()

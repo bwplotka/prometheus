@@ -375,3 +375,131 @@ instead.
 When enabled, Prometheus advertises support for Zstandard-compressed scrape responses in addition to gzip. The uncompressed response remains subject to the configured `body_size_limit`.
 
 When the flag is disabled, Prometheus does not advertise `zstd`. A target that answers with `Content-Encoding: zstd` regardless fails the scrape, because Prometheus cannot decode the body.
+
+## Query-time histogram conversion
+
+`--enable-feature=promql-histogram-conversion`
+
+Converts between classic and native histograms while evaluating PromQL queries, so that queries
+written for one representation keep working for histograms stored as the other one, e.g. while
+migrating from classic histograms to native histograms with custom buckets (NHCB). Unlike the
+`convert_classic_histograms_to_nhcb` scrape option, it never changes what is stored or remote
+written.
+
+`--query.convert-histograms-from` lists the representations to convert from. Like
+`--enable-feature`, it takes a comma separated list and can be repeated. It is empty by default,
+and the feature has no effect, including the control labels described below, until it lists at
+least one representation:
+
+* `classic`: The `_bucket`, `_count` and `_sum` series of classic histograms are converted to NHCB
+  with the same buckets, for selectors of the base name.
+* `nhcb`: NHCB are converted to classic histogram series with the same buckets, for selectors of
+  their `_bucket`, `_count` and `_sum` series.
+* `nhe`: Native histograms with exponential buckets are converted to classic histogram series with
+  derived buckets, see below.
+
+For example, with `--query.convert-histograms-from=nhcb`, queries for the classic histogram series
+of `request_duration_seconds` keep working after enabling `convert_classic_histograms_to_nhcb` for
+it:
+
+```promql
+# Returns the stored classic series, and after the switch the ones converted
+# from the stored NHCB:
+histogram_quantile(0.95, rate(request_duration_seconds_bucket[5m]))
+
+# Returns the stored NHCB:
+histogram_quantile(0.95, rate(request_duration_seconds[5m]))
+```
+
+Each series selector with a metric name equality matcher is converted in one direction only:
+
+* A metric name with a `_bucket`, `_count` or `_sum` suffix returns the stored classic histogram
+  series, plus the ones converted from the native histograms of the base name, from `nhcb` and
+  `nhe`. `le` matchers are applied to the converted series.
+* Any other metric name returns the stored series, plus the NHCB converted from the classic
+  histogram series of that name, from `classic`. As NHCB have no `le` label, nothing is converted
+  if the selector has a `le` matcher that does not match the empty value.
+* Selectors without a metric name equality matcher, e.g. `{__name__=~"request_duration.*"}`, are
+  not converted.
+
+Converted series are never converted back, so all conversions can be enabled at the same time.
+
+Where a selector reads a histogram both stored and converted, e.g. in a range covering a migration,
+or while `always_scrape_classic_histograms` is enabled, stored data wins. Nothing is converted at
+the timestamps of the stored samples of the same histogram, and the converted samples fill the gaps
+of the stored series with the same labels. So `rate()` works across a migration, and aggregations
+do not count a histogram twice. For classic histograms, the same histogram means the same labels
+except `le`, so the buckets converted from an exponential histogram end where a stored classic
+histogram with other buckets takes over.
+
+Two control labels give per selector control. Matchers on them are removed before selecting from
+the storage, and returned series never have them:
+
+* A `__convert_stored_as__` matcher selects the representations a selector reads, stored or
+  converted, overriding `--query.convert-histograms-from`. It is matched against `classic`, `nhcb`
+  and `nhe`: float samples are `classic`, native histograms with custom buckets `nhcb`, and those
+  with exponential buckets `nhe`, and converted samples have the representation they were
+  converted from. Several matchers must all match. `__convert_stored_as__=""`, or any matchers
+  that match the empty value but none of the representations, turn the conversion off for the
+  selector: it returns the stored series as they are, as if the feature were disabled. Other
+  matchers that match none of the representations select nothing. Where a stored series changes
+  to a representation the selector does not read, it is marked stale. Stored data the selector
+  does not read does not win over converted data.
+* `__debug_stored_as__="true"` adds a `__stored_as__` label to the returned series, holding the
+  representation their samples are stored as. A stored series whose samples change representation
+  is split into one series per representation. Stored and converted series are not merged then,
+  but stored data still wins, so the result shows which representation each sample is taken from.
+  `__stored_as__` is a normal label, e.g. `sum by (le)` drops it and `sum by (le, __stored_as__)`
+  keeps it.
+
+For example, with `--query.convert-histograms-from=nhcb`:
+
+| Selector | Result |
+|---|---|
+| `foo_bucket` | Stored series, plus the series converted from NHCB. |
+| `foo_bucket{__convert_stored_as__="classic"}` | Stored series only. |
+| `foo_bucket{__convert_stored_as__=""}` | Stored series as they are, as if the feature were disabled. |
+| `foo_bucket{__convert_stored_as__="nhcb"}` | Only the series converted from NHCB. |
+| `foo_bucket{__convert_stored_as__="nhe"}` | Only the series converted from exponential histograms. |
+| `foo{__convert_stored_as__="nhe"}` | Stored exponential histograms only. |
+| `foo{__convert_stored_as__="classic"}` | Only the NHCB converted from classic series. |
+| `foo_bucket{__convert_stored_as__=~".*", __debug_stored_as__="true"}` | Stored series, plus the series converted from every representation, with `__stored_as__`. |
+
+As for any selector, at least one matcher besides the control matchers must not match the empty
+value. Where the feature is disabled, or `--query.convert-histograms-from` is empty, no series has
+the control labels: `__convert_stored_as__=""` returns the stored series, as it does with the
+feature, and control matchers that do not match the empty value, e.g. `__convert_stored_as__="nhcb"`
+or `__debug_stored_as__="true"`, select nothing.
+
+Unlike NHCB, native histograms with an exponential schema have no fixed bucket boundaries. So that
+the converted `_bucket` series can be aggregated across series and over time, e.g. with
+`sum by (le)` or `rate()`, all exponential histograms selected by a selector are converted with the
+same derived `le` boundaries: the union of their bucket boundaries, reduced to the lowest schema
+amongst them. The count at each boundary is exact, but:
+
+* The `le` boundaries depend on the series and the time range selected by the query.
+* A single histogram with a low resolution lowers the resolution of all of them.
+* Histograms with many populated buckets result in many `_bucket` series.
+
+Also note that:
+
+* The `le` label of a converted `_bucket` series is formatted as a float, e.g. `le="1.0"`, like the
+  `le` label of scraped classic histograms since Prometheus v3.0.
+* `histogram_quantile()` interpolates linearly within the buckets of a classic histogram, but
+  exponentially within the buckets of a native histogram with an exponential schema. Quantiles
+  calculated from converted classic series hence differ from the quantiles calculated from the
+  exponential histograms they were converted from.
+* A histogram that cannot be converted, e.g. a classic histogram whose bucket counts are not
+  cumulative or an invalid native histogram, is skipped for the affected timestamps, and a warning
+  annotation is attached to the query result.
+
+Limitations:
+
+* Conversions only apply to PromQL queries, e.g. of the query API and of rules, for both local and
+  remote read data. The remote read endpoint, federation and the `/api/v1/series`, `/api/v1/labels`
+  and `/api/v1/label/<name>/values` endpoints return stored data only.
+* Stored data only wins at the exact timestamps of its samples. Where a histogram is stored in both
+  representations at different timestamps, e.g. ingested from different sources, the merged series
+  alternates between them.
+* The series to convert from, and the stored series of selectors with control matchers, are
+  buffered in memory, and this memory is not accounted in `--query.max-samples`.

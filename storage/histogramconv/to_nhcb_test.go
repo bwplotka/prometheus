@@ -1,0 +1,473 @@
+// Copyright The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package histogramconv
+
+import (
+	"context"
+	"errors"
+	"math"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/prometheus/common/model"
+	"github.com/stretchr/testify/require"
+
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/util/annotations"
+)
+
+// classicHistogramSeries returns the classic series of a histogram with the
+// buckets le=1 and le=+Inf, observed at t=1 and t=2.
+func classicHistogramSeries(extraLabels ...string) []storage.Series {
+	lbls := func(name string, kv ...string) labels.Labels {
+		all := append([]string{model.MetricNameLabel, name}, kv...)
+		return labels.FromStrings(append(all, extraLabels...)...)
+	}
+	return []storage.Series{
+		storage.NewListSeries(lbls("http_requests_bucket", labels.BucketLabel, "1"), []chunks.Sample{fSample{t: 1, f: 2}, fSample{t: 2, f: 3}}),
+		storage.NewListSeries(lbls("http_requests_bucket", labels.BucketLabel, "+Inf"), []chunks.Sample{fSample{t: 1, f: 5}, fSample{t: 2, f: 7}}),
+		storage.NewListSeries(lbls("http_requests_count"), []chunks.Sample{fSample{t: 1, f: 5}, fSample{t: 2, f: 7}}),
+		storage.NewListSeries(lbls("http_requests_sum"), []chunks.Sample{fSample{t: 1, f: 10}, fSample{t: 2, f: 14}}),
+	}
+}
+
+func TestQuerier_ToNHCB(t *testing.T) {
+	// nhcb is the NHCB converted from classicHistogramSeries at t=1.
+	nhcb := &histogram.Histogram{
+		Schema:          histogram.CustomBucketsSchema,
+		Count:           5,
+		Sum:             10,
+		CustomValues:    []float64{1},
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []int64{2, 1},
+	}
+	// storedNHCB has other values than nhcb, so that it can be told apart
+	// from it.
+	storedNHCB := &histogram.Histogram{
+		Schema:          histogram.CustomBucketsSchema,
+		Count:           6,
+		Sum:             12,
+		CustomValues:    []float64{1},
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []int64{1, 4},
+	}
+
+	tests := []struct {
+		name           string
+		queryMatchers  []*labels.Matcher
+		classicSeries  []storage.Series
+		nativeSeries   []storage.Series
+		expectedSeries []string
+	}{
+		{
+			name:          "no classic histogram - native series passes through",
+			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
+			nativeSeries: []storage.Series{
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests"), []chunks.Sample{hSample{t: 1, h: storedNHCB}}),
+			},
+			expectedSeries: []string{`{__name__="http_requests"} {count:6, sum:12, [-Inf,1]:1, (1,+Inf]:5}@1`},
+		},
+		{
+			name:          "classic histogram only - converted to NHCB",
+			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
+			classicSeries: classicHistogramSeries(),
+			expectedSeries: []string{
+				`{__name__="http_requests"} {count:5, sum:10, [-Inf,1]:2, (1,+Inf]:3}@1 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@2`,
+			},
+		},
+		{
+			name:           "regexp name matchers are not converted",
+			queryMatchers:  []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, model.MetricNameLabel, "http_.*")},
+			classicSeries:  classicHistogramSeries(),
+			expectedSeries: nil,
+		},
+		{
+			name:          "one classic histogram per label set",
+			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
+			classicSeries: append(classicHistogramSeries("job", "api"), classicHistogramSeries("job", "web")...),
+			expectedSeries: []string{
+				`{__name__="http_requests", job="api"} {count:5, sum:10, [-Inf,1]:2, (1,+Inf]:3}@1 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@2`,
+				`{__name__="http_requests", job="web"} {count:5, sum:10, [-Inf,1]:2, (1,+Inf]:3}@1 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@2`,
+			},
+		},
+		{
+			// This is the migration overlap: the stored native histogram
+			// wins at t=1, the converted one fills the gap at t=2, and both
+			// are one series. See TestQuerier_Stored and TestPromQL.
+			name:          "native and classic histogram - stored native histogram wins",
+			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
+			classicSeries: classicHistogramSeries(),
+			nativeSeries: []storage.Series{
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests"), []chunks.Sample{hSample{t: 1, h: storedNHCB}}),
+			},
+			expectedSeries: []string{
+				`{__name__="http_requests"} {count:6, sum:12, [-Inf,1]:1, (1,+Inf]:5}@1 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@2`,
+			},
+		},
+		{
+			name: "le matcher disables the conversion",
+			queryMatchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests"),
+				labels.MustNewMatcher(labels.MatchEqual, labels.BucketLabel, "1"),
+			},
+			classicSeries:  classicHistogramSeries(),
+			expectedSeries: nil,
+		},
+		{
+			name:           "classic histogram query passes through",
+			queryMatchers:  []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket")},
+			classicSeries:  classicHistogramSeries(),
+			expectedSeries: nil, // The mock querier only answers base name queries with classic series.
+		},
+		{
+			name:          "buckets returned in lexicographic le order are sorted",
+			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
+			classicSeries: []storage.Series{
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "+Inf"), []chunks.Sample{fSample{t: 1, f: 5}}),
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "1"), []chunks.Sample{fSample{t: 1, f: 2}}),
+			},
+			expectedSeries: []string{`{__name__="http_requests"} {count:5, sum:0, [-Inf,1]:2, (1,+Inf]:3}@1`},
+		},
+		{
+			name:          "no data at all",
+			queryMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests")},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q := NewQuerier(&classicMockQuerier{
+				classicSeries: tc.classicSeries,
+				nativeSeries:  tc.nativeSeries,
+			}, []Representation{Classic})
+
+			ss := q.Select(context.Background(), false, nil, tc.queryMatchers...)
+			require.Equal(t, tc.expectedSeries, samplesSummary(t, ss))
+		})
+	}
+
+	t.Run("converted samples", func(t *testing.T) {
+		q := NewQuerier(&classicMockQuerier{classicSeries: classicHistogramSeries()}, []Representation{Classic})
+		ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests"))
+		require.True(t, ss.Next())
+
+		it := ss.At().Iterator(nil)
+		require.Equal(t, chunkenc.ValHistogram, it.Next())
+		ts, h := it.AtHistogram(nil)
+		require.Equal(t, int64(1), ts)
+		require.Equal(t, nhcb, h)
+
+		require.Equal(t, chunkenc.ValHistogram, it.Next())
+		ts, h = it.AtHistogram(nil)
+		require.Equal(t, int64(2), ts)
+		require.Equal(t, &histogram.Histogram{
+			Schema:          histogram.CustomBucketsSchema,
+			Count:           7,
+			Sum:             14,
+			CustomValues:    []float64{1},
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+			PositiveBuckets: []int64{3, 1},
+		}, h)
+
+		require.Equal(t, chunkenc.ValNone, it.Next())
+		require.False(t, ss.Next())
+		require.NoError(t, ss.Err())
+		require.Empty(t, ss.Warnings())
+	})
+
+	t.Run("float bucket counts produce a float histogram", func(t *testing.T) {
+		q := NewQuerier(&classicMockQuerier{classicSeries: []storage.Series{
+			storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "1"), []chunks.Sample{fSample{t: 1, f: 2.5}}),
+			storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "+Inf"), []chunks.Sample{fSample{t: 1, f: 5}}),
+		}}, []Representation{Classic})
+		ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests"))
+		require.True(t, ss.Next())
+
+		it := ss.At().Iterator(nil)
+		require.Equal(t, chunkenc.ValFloatHistogram, it.Next())
+		_, fh := it.AtFloatHistogram(nil)
+		require.Equal(t, float64(5), fh.Count)
+		require.Equal(t, []float64{2.5, 2.5}, fh.PositiveBuckets)
+		require.NoError(t, ss.Err())
+	})
+}
+
+func TestQuerier_ToNHCBConversionWarnings(t *testing.T) {
+	tests := []struct {
+		name            string
+		classicSeries   []storage.Series
+		expectedSeries  int
+		expectedWarning string
+	}{
+		{
+			name: "non-cumulative buckets",
+			classicSeries: []storage.Series{
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "1"), []chunks.Sample{fSample{t: 1, f: 5}}),
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "+Inf"), []chunks.Sample{fSample{t: 1, f: 2}}),
+			},
+			expectedWarning: "count is not cumulative",
+		},
+		{
+			name: "count does not match the +Inf bucket",
+			classicSeries: []storage.Series{
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "+Inf"), []chunks.Sample{fSample{t: 1, f: 5}}),
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_count"), []chunks.Sample{fSample{t: 1, f: 7}}),
+			},
+			expectedWarning: "count mismatch",
+		},
+		{
+			name: "sum without buckets and without count",
+			classicSeries: []storage.Series{
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_sum"), []chunks.Sample{fSample{t: 1, f: 7}}),
+			},
+			expectedWarning: "count must be provided when no buckets are present",
+		},
+		{
+			name: "malformed le label",
+			classicSeries: []storage.Series{
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "not-a-number"), []chunks.Sample{fSample{t: 1, f: 5}}),
+			},
+			expectedWarning: `malformed bucket label "not-a-number"`,
+		},
+		{
+			// Only the broken timestamp is dropped, the rest of the series is
+			// still returned.
+			name: "partially broken series",
+			classicSeries: []storage.Series{
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_bucket", labels.BucketLabel, "+Inf"), []chunks.Sample{fSample{t: 1, f: 5}, fSample{t: 2, f: 7}}),
+				storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests_count"), []chunks.Sample{fSample{t: 1, f: 5}, fSample{t: 2, f: 9}}),
+			},
+			expectedSeries:  1,
+			expectedWarning: "count mismatch",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q := NewQuerier(&classicMockQuerier{classicSeries: tc.classicSeries}, []Representation{Classic})
+			ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests"))
+			var count int
+			for ss.Next() {
+				count++
+			}
+			require.NoError(t, ss.Err())
+			require.Equal(t, tc.expectedSeries, count)
+
+			warnings, _ := ss.Warnings().AsStrings("", 0, 0)
+			require.Len(t, warnings, 1)
+			require.Contains(t, warnings[0], "classic histogram could not be converted")
+			require.Contains(t, warnings[0], tc.expectedWarning)
+		})
+	}
+}
+
+func TestQuerier_ToNHCBStaleness(t *testing.T) {
+	stale := math.Float64frombits(value.StaleNaN)
+	// series returns a classic series with the given values at t=1, t=2, etc.
+	series := func(name string, lbls []string, values ...float64) storage.Series {
+		samples := make([]chunks.Sample, 0, len(values))
+		for i, v := range values {
+			samples = append(samples, fSample{t: int64(i + 1), f: v})
+		}
+		return storage.NewListSeries(labels.FromStrings(append([]string{model.MetricNameLabel, name}, lbls...)...), samples)
+	}
+
+	for _, tc := range []struct {
+		name          string
+		classicSeries []storage.Series
+		expected      []string
+	}{
+		{
+			name: "all series stale",
+			classicSeries: []storage.Series{
+				series("http_requests_bucket", []string{labels.BucketLabel, "1"}, 2, stale, 3),
+				series("http_requests_bucket", []string{labels.BucketLabel, "+Inf"}, 5, stale, 7),
+				series("http_requests_count", nil, 5, stale, 7),
+				series("http_requests_sum", nil, 10, stale, 14),
+			},
+			expected: []string{
+				`{__name__="http_requests"} {count:5, sum:10, [-Inf,1]:2, (1,+Inf]:3}@1 stale@2 {count:7, sum:14, [-Inf,1]:3, (1,+Inf]:4}@3`,
+			},
+		},
+		{
+			name: "some series stale",
+			classicSeries: []storage.Series{
+				series("http_requests_bucket", []string{labels.BucketLabel, "1"}, 2, stale),
+				series("http_requests_bucket", []string{labels.BucketLabel, "+Inf"}, 5, 7),
+				series("http_requests_count", nil, 5, 7),
+				series("http_requests_sum", nil, 10, 14),
+			},
+			expected: []string{
+				`{__name__="http_requests"} {count:5, sum:10, [-Inf,1]:2, (1,+Inf]:3}@1 {count:7, sum:14, [-Inf,+Inf]:7}@2`,
+			},
+		},
+		{
+			name: "classic histograms go stale independently",
+			classicSeries: []storage.Series{
+				series("http_requests_bucket", []string{labels.BucketLabel, "+Inf", "job", "a"}, 5, stale),
+				series("http_requests_bucket", []string{labels.BucketLabel, "+Inf", "job", "b"}, 5, 7),
+			},
+			expected: []string{
+				`{__name__="http_requests", job="a"} {count:5, sum:0, [-Inf,+Inf]:5}@1 stale@2`,
+				`{__name__="http_requests", job="b"} {count:5, sum:0, [-Inf,+Inf]:5}@1 {count:7, sum:0, [-Inf,+Inf]:7}@2`,
+			},
+		},
+		{
+			name: "no leading or consecutive staleness markers",
+			classicSeries: []storage.Series{
+				series("http_requests_bucket", []string{labels.BucketLabel, "+Inf"}, stale, 5, stale, stale, 7),
+				series("http_requests_count", nil, stale, 5, stale, stale, 7),
+			},
+			expected: []string{
+				`{__name__="http_requests"} {count:5, sum:0, [-Inf,+Inf]:5}@2 stale@3 {count:7, sum:0, [-Inf,+Inf]:7}@5`,
+			},
+		},
+		{
+			// Converted series without samples other than staleness markers
+			// are not returned.
+			name: "only stale markers",
+			classicSeries: []storage.Series{
+				series("http_requests_bucket", []string{labels.BucketLabel, "+Inf"}, stale),
+				series("http_requests_count", nil, stale),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := NewQuerier(&classicMockQuerier{classicSeries: tc.classicSeries}, []Representation{Classic})
+			ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests"))
+			require.ElementsMatch(t, tc.expected, samplesSummary(t, ss))
+			require.Empty(t, ss.Warnings())
+		})
+	}
+}
+
+func TestQuerier_ToNHCBErrorPropagation(t *testing.T) {
+	testError := errors.New("storage error")
+
+	tests := []struct {
+		name    string
+		querier storage.Querier
+	}{
+		{
+			name:    "native set immediate error",
+			querier: &classicMockQuerier{nativeErr: testError},
+		},
+		{
+			name:    "classic set immediate error",
+			querier: &classicMockQuerier{classicErr: testError},
+		},
+		{
+			name: "error during iteration",
+			querier: &classicSetQuerier{
+				set: newDeferredErrSeriesSet(testError),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q := NewQuerier(tc.querier, []Representation{Classic})
+			ss := q.Select(context.Background(), false, nil,
+				labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests"))
+			for ss.Next() {
+			}
+			require.ErrorIs(t, ss.Err(), testError)
+		})
+	}
+}
+
+func TestQuerier_ToNHCBWarningPropagation(t *testing.T) {
+	warn := annotations.New().Add(errors.New("storage warning"))
+
+	q := NewQuerier(&classicSetQuerier{
+		set: &mockSeriesSet{idx: -1, warnings: warn, series: append([]storage.Series{
+			storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests"), []chunks.Sample{fSample{t: 1, f: 1}}),
+		}, classicHistogramSeries()...)},
+	}, []Representation{Classic})
+
+	ss := q.Select(context.Background(), false, nil,
+		labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests"))
+	for ss.Next() {
+	}
+	require.NoError(t, ss.Err())
+	require.Equal(t, warn, ss.Warnings())
+}
+
+// classicMockQuerier answers queries carrying the classic suffix pattern with
+// both nativeSeries and classicSeries, and other queries with nativeSeries.
+type classicMockQuerier struct {
+	classicSeries []storage.Series
+	nativeSeries  []storage.Series
+
+	classicErr error
+	nativeErr  error
+}
+
+func (m *classicMockQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	for _, matcher := range matchers {
+		if matcher.Name != model.MetricNameLabel {
+			continue
+		}
+		if strings.Contains(matcher.Value, classicSuffixesPattern) {
+			if m.nativeErr != nil {
+				return storage.ErrSeriesSet(m.nativeErr)
+			}
+			if m.classicErr != nil {
+				return storage.ErrSeriesSet(m.classicErr)
+			}
+			return newMockSeriesSet(slices.Concat(m.nativeSeries, m.classicSeries)...)
+		}
+		if m.nativeErr != nil {
+			return storage.ErrSeriesSet(m.nativeErr)
+		}
+		return newMockSeriesSet(m.nativeSeries...)
+	}
+	return newMockSeriesSet()
+}
+
+func (*classicMockQuerier) LabelValues(context.Context, string, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return nil, nil, nil
+}
+
+func (*classicMockQuerier) LabelNames(context.Context, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return nil, nil, nil
+}
+
+func (*classicMockQuerier) Close() error { return nil }
+
+// classicSetQuerier returns set from Select so that tests can inject arbitrary
+// storage.SeriesSet implementations.
+type classicSetQuerier struct {
+	set storage.SeriesSet
+}
+
+func (m *classicSetQuerier) Select(context.Context, bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet {
+	return m.set
+}
+
+func (*classicSetQuerier) LabelValues(context.Context, string, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return nil, nil, nil
+}
+
+func (*classicSetQuerier) LabelNames(context.Context, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return nil, nil, nil
+}
+
+func (*classicSetQuerier) Close() error { return nil }
