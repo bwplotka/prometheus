@@ -230,10 +230,12 @@ its gaps:
 * A converted sample is dropped where the stored data the selector reads has a non-stale sample of the same histogram
   at the same timestamp. For classic series, the same histogram means the same labels except `__name__` and `le`,
   e.g. `foo_bucket{job="a"}` only gets buckets converted from `foo{job="a"}` at timestamps where no
-  `foo_bucket{job="a"}` series has a sample, also if the selector has a `le` matcher. This also covers buckets
-  converted from exponential histograms, whose `le` values differ from the stored ones, so merging by labels alone
-  would mix both bucket layouts. The first dropped sample after a returned one becomes a staleness marker, so that
-  such buckets end where the stored histogram takes over, rather than at the end of the lookback window.
+  `foo_bucket{job="a"}` series has a sample. This also covers buckets converted from exponential histograms, whose `le`
+  values differ from the stored ones, so merging by labels alone would mix both bucket layouts. The first dropped
+  sample after a returned one becomes a staleness marker, so that such buckets end where the stored histogram takes
+  over, rather than at the end of the lookback window. A selector with `le` matchers only reads the matching stored
+  buckets, so if none of the stored buckets match, e.g. `foo_bucket{le="2.5"}` where the stored classic histogram has
+  other `le` values, the matching converted buckets are returned.
 * Converted series are then merged into the stored series with the same labels.
 * A staleness marker of one side of a merged series only ends that side, so it is dropped if the other side has a
   sample at the same timestamp, or if the sample before the marker is from the other side. When a histogram switches
@@ -344,9 +346,7 @@ or interpolated, but:
 
 ### Performance
 
-* Every converted selector does one more select. Selectors with a `le` matcher do another one to find the timestamps
-  of the stored classic histograms, even if nothing is converted, as queriers that merge remote read storage do not
-  allow selects after the first series is read. Its series are only read if anything is converted.
+* Every converted selector does one more select.
 * Conversions, and selectors with control matchers, buffer the samples they read, the classic side all native
   histograms of the selector, as the derived buckets depend on all of them. That memory is not accounted in
   `--query.max-samples` yet, and should be.

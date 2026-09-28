@@ -461,16 +461,16 @@ func TestQuerier_Stored(t *testing.T) {
 			},
 		},
 		{
-			// The stored classic histogram is selected without the le
-			// matcher to find its timestamps.
-			name: "stored wins: le matchers",
+			// The stored classic bucket is not selected by the le matcher, so
+			// the converted bucket is returned at all timestamps.
+			name: "stored wins: le matcher not matching any stored bucket",
 			series: []storage.Series{
 				storage.NewListSeries(bucket("+Inf"), []chunks.Sample{fSample{t: 2, f: 5}}),
 				storage.NewListSeries(foo, []chunks.Sample{hSample{t: 1, h: nhcb}, hSample{t: 2, h: nhcb}}),
 			},
 			convertFrom: []Representation{NHCB},
 			matchers:    []*labels.Matcher{name("foo_bucket"), le("1.0")},
-			expected:    []string{`{__name__="foo_bucket", le="1.0"} 1@1 stale@2`},
+			expected:    []string{`{__name__="foo_bucket", le="1.0"} 1@1 1@2`},
 		},
 		{
 			name: "stored wins: only where the selector reads the stored data",

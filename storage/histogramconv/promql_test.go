@@ -961,7 +961,10 @@ eval instant at 5m foo_bucket
 	foo_bucket{job="a", le="2"} 3
 	foo_bucket{job="a", le="+Inf"} 4
 
+# A selector whose le matcher does not match any stored bucket returns the
+# matching converted bucket.
 eval instant at 5m foo_bucket{le="0.5"}
+	foo_bucket{job="a", le="0.5"} 0
 
 eval instant at 4m histogram_quantile(0.5, foo_bucket)
 	{job="a"} 1.5

@@ -76,45 +76,24 @@ func (s *seriesSet) storedWins(stored, converted []*series) ([]*series, error) {
 		ts  []int64
 		err error
 	)
-	if ss := s.allBucketsSet; ss != nil {
-		// The stored series of a histogram can have other le values than the
-		// converted ones, see Select.
-		for ss.Next() {
-			h := idx.get(ss.At().Labels())
-			if h == nil {
-				continue
-			}
-			if ts, err = s.appendTimestamps(ts[:0], ss.At(), s.sel.stored); err != nil {
+	for _, st := range stored {
+		h := idx.get(st.lset)
+		if h == nil {
+			continue
+		}
+		if st.stored != nil {
+			if ts, err = s.appendTimestamps(ts[:0], st.stored); err != nil {
 				return nil, err
 			}
-			h.addTimestamps(ts)
-		}
-		s.warnings.Merge(ss.Warnings())
-		if err = ss.Err(); err != nil {
-			return nil, err
-		}
-	} else {
-		for _, st := range stored {
-			h := idx.get(st.lset)
-			if h == nil {
-				continue
-			}
-			if st.stored != nil {
-				// A stored series returned unchanged, all its samples are
-				// read by the selector.
-				if ts, err = s.appendTimestamps(ts[:0], st.stored, allRepresentations); err != nil {
-					return nil, err
-				}
-			} else {
-				ts = ts[:0]
-				for _, smpl := range st.samples {
-					if !isStale(smpl) {
-						ts = append(ts, smpl.T())
-					}
+		} else {
+			ts = ts[:0]
+			for _, smpl := range st.samples {
+				if !isStale(smpl) {
+					ts = append(ts, smpl.T())
 				}
 			}
-			h.addTimestamps(ts)
 		}
+		h.addTimestamps(ts)
 	}
 
 	kept := converted[:0]
@@ -146,27 +125,24 @@ func (s *seriesSet) readSamples(ser storage.Series) ([]chunks.Sample, error) {
 	return samples, s.it.Err()
 }
 
-// appendTimestamps appends the timestamps of the samples of the series ser
-// whose representation is in reprs to ts, without staleness markers.
-func (s *seriesSet) appendTimestamps(ts []int64, ser storage.Series, reprs representations) ([]int64, error) {
+// appendTimestamps appends the timestamps of the samples of the series ser to
+// ts, without staleness markers.
+func (s *seriesSet) appendTimestamps(ts []int64, ser storage.Series) ([]int64, error) {
 	s.it = ser.Iterator(s.it)
 	for vt := s.it.Next(); vt != chunkenc.ValNone; vt = s.it.Next() {
-		var (
-			r     Representation
-			stale bool
-		)
+		var stale bool
 		switch vt {
 		case chunkenc.ValHistogram:
 			_, s.h = s.it.AtHistogram(s.h)
-			r, stale = nativeRepresentation(s.h.Schema), value.IsStaleNaN(s.h.Sum)
+			stale = value.IsStaleNaN(s.h.Sum)
 		case chunkenc.ValFloatHistogram:
 			_, s.fh = s.it.AtFloatHistogram(s.fh)
-			r, stale = nativeRepresentation(s.fh.Schema), value.IsStaleNaN(s.fh.Sum)
+			stale = value.IsStaleNaN(s.fh.Sum)
 		default:
 			_, f := s.it.At()
-			r, stale = Classic, value.IsStaleNaN(f)
+			stale = value.IsStaleNaN(f)
 		}
-		if !stale && reprs.has(r) {
+		if !stale {
 			ts = append(ts, s.it.AtT())
 		}
 	}
