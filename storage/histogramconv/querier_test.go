@@ -97,6 +97,9 @@ func TestQuerier(t *testing.T) {
 		name        string
 		convertFrom []histogramconv.Representation
 		matchers    []*labels.Matcher
+		// expectedSelects is the expected number of Select calls on the
+		// wrapped querier, 1 if 0.
+		expectedSelects int
 		// expected holds every returned series, see selectSummary. Duplicates
 		// are not allowed, which would e.g. show up if the classic series were
 		// converted to NHCB and back.
@@ -128,6 +131,7 @@ func TestQuerier(t *testing.T) {
 				labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "rpc_latency_seconds_bucket"),
 				labels.MustNewMatcher(labels.MatchEqual, labels.BucketLabel, "+Inf"),
 			},
+			expectedSelects: 2,
 			expected: []string{
 				`{__name__="rpc_latency_seconds_bucket", job="classic", le="+Inf"} 4@0 4@60000 stale@120000`,
 				`{__name__="rpc_latency_seconds_bucket", job="nhcb", le="+Inf"} 4@0 4@60000 stale@120000`,
@@ -179,9 +183,19 @@ func TestQuerier(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, q.Close()) })
 
-			ss := histogramconv.NewQuerier(q, tc.convertFrom).Select(context.Background(), false, nil, tc.matchers...)
+			var selects int
+			counting := &storage.MockQuerier{SelectMockFunction: func(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+				selects++
+				return q.Select(context.Background(), sortSeries, hints, matchers...)
+			}}
+			ss := histogramconv.NewQuerier(counting, tc.convertFrom).Select(context.Background(), false, nil, tc.matchers...)
 			require.ElementsMatch(t, tc.expected, selectSummary(t, ss))
 			require.Empty(t, ss.Warnings())
+			expectedSelects := tc.expectedSelects
+			if expectedSelects == 0 {
+				expectedSelects = 1
+			}
+			require.Equal(t, expectedSelects, selects)
 		})
 	}
 }

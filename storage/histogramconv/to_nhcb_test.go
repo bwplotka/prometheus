@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 
@@ -373,10 +374,9 @@ func TestQuerier_ToNHCBErrorPropagation(t *testing.T) {
 			querier: &classicMockQuerier{classicErr: testError},
 		},
 		{
-			name: "classic set error during iteration",
+			name: "error during iteration",
 			querier: &classicSetQuerier{
-				nativeSet:  newMockSeriesSet(),
-				classicSet: newDeferredErrSeriesSet(testError),
+				set: newDeferredErrSeriesSet(testError),
 			},
 		},
 	}
@@ -394,14 +394,12 @@ func TestQuerier_ToNHCBErrorPropagation(t *testing.T) {
 }
 
 func TestQuerier_ToNHCBWarningPropagation(t *testing.T) {
-	nativeWarning := annotations.New().Add(errors.New("native warning"))
-	classicWarning := annotations.New().Add(errors.New("classic warning"))
+	warn := annotations.New().Add(errors.New("storage warning"))
 
 	q := NewQuerier(&classicSetQuerier{
-		nativeSet: &mockSeriesSet{idx: -1, warnings: nativeWarning, series: []storage.Series{
+		set: &mockSeriesSet{idx: -1, warnings: warn, series: append([]storage.Series{
 			storage.NewListSeries(labels.FromStrings(model.MetricNameLabel, "http_requests"), []chunks.Sample{fSample{t: 1, f: 1}}),
-		}},
-		classicSet: &mockSeriesSet{idx: -1, warnings: classicWarning, series: classicHistogramSeries()},
+		}, classicHistogramSeries()...)},
 	}, []Representation{Classic})
 
 	ss := q.Select(context.Background(), false, nil,
@@ -409,15 +407,11 @@ func TestQuerier_ToNHCBWarningPropagation(t *testing.T) {
 	for ss.Next() {
 	}
 	require.NoError(t, ss.Err())
-	expected := annotations.New()
-	expected.Merge(nativeWarning)
-	expected.Merge(classicWarning)
-	require.Equal(t, *expected, ss.Warnings())
+	require.Equal(t, warn, ss.Warnings())
 }
 
-// classicMockQuerier answers queries for the base metric name with
-// nativeSeries, and queries carrying the classic suffix pattern with
-// classicSeries.
+// classicMockQuerier answers queries carrying the classic suffix pattern with
+// both nativeSeries and classicSeries, and other queries with nativeSeries.
 type classicMockQuerier struct {
 	classicSeries []storage.Series
 	nativeSeries  []storage.Series
@@ -432,10 +426,13 @@ func (m *classicMockQuerier) Select(_ context.Context, _ bool, _ *storage.Select
 			continue
 		}
 		if strings.Contains(matcher.Value, classicSuffixesPattern) {
+			if m.nativeErr != nil {
+				return storage.ErrSeriesSet(m.nativeErr)
+			}
 			if m.classicErr != nil {
 				return storage.ErrSeriesSet(m.classicErr)
 			}
-			return newMockSeriesSet(m.classicSeries...)
+			return newMockSeriesSet(slices.Concat(m.nativeSeries, m.classicSeries)...)
 		}
 		if m.nativeErr != nil {
 			return storage.ErrSeriesSet(m.nativeErr)
@@ -455,25 +452,14 @@ func (*classicMockQuerier) LabelNames(context.Context, *storage.LabelHints, ...*
 
 func (*classicMockQuerier) Close() error { return nil }
 
-// classicSetQuerier routes queries with the classic suffix pattern to
-// classicSet and all other queries to nativeSet, so that tests can inject
-// arbitrary storage.SeriesSet implementations.
+// classicSetQuerier returns set from Select so that tests can inject arbitrary
+// storage.SeriesSet implementations.
 type classicSetQuerier struct {
-	classicSet storage.SeriesSet
-	nativeSet  storage.SeriesSet
+	set storage.SeriesSet
 }
 
-func (m *classicSetQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
-	for _, matcher := range matchers {
-		if matcher.Name != model.MetricNameLabel {
-			continue
-		}
-		if strings.Contains(matcher.Value, classicSuffixesPattern) {
-			return m.classicSet
-		}
-		return m.nativeSet
-	}
-	return newMockSeriesSet()
+func (m *classicSetQuerier) Select(context.Context, bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet {
+	return m.set
 }
 
 func (*classicSetQuerier) LabelValues(context.Context, string, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {

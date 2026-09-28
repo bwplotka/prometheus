@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -682,26 +683,36 @@ type nhcbMockQuerier struct {
 
 func (m *nhcbMockQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	for _, matcher := range matchers {
-		if matcher.Name == model.MetricNameLabel {
-			// Check if this is a histogram suffix query (classic histogram query)
-			if strings.HasSuffix(matcher.Value, "_bucket") ||
-				strings.HasSuffix(matcher.Value, "_count") ||
-				strings.HasSuffix(matcher.Value, "_sum") {
-				if m.classicErr != nil {
-					return storage.ErrSeriesSet(m.classicErr)
-				}
-				return newMockSeriesSet(m.classicSeries...)
+		if matcher.Name != model.MetricNameLabel {
+			continue
+		}
+		if matcher.Type == labels.MatchRegexp && strings.Contains(matcher.Value, "(|") {
+			if m.classicErr != nil {
+				return storage.ErrSeriesSet(m.classicErr)
 			}
-			// If passthroughSeries is set, use it for non-histogram metric queries
-			if len(m.passthroughSeries) > 0 {
-				return newMockSeriesSet(m.passthroughSeries...)
-			}
-			// Base metric name query - return NHCB series
 			if m.nhcbErr != nil {
 				return storage.ErrSeriesSet(m.nhcbErr)
 			}
-			return &mockSeriesSet{idx: -1, series: m.nhcbSeries, warnings: m.nhcbWarnings}
+			return &mockSeriesSet{idx: -1, series: slices.Concat(m.classicSeries, m.nhcbSeries), warnings: m.nhcbWarnings}
 		}
+		// Check if this is a histogram suffix query (classic histogram query)
+		if strings.HasSuffix(matcher.Value, "_bucket") ||
+			strings.HasSuffix(matcher.Value, "_count") ||
+			strings.HasSuffix(matcher.Value, "_sum") {
+			if m.classicErr != nil {
+				return storage.ErrSeriesSet(m.classicErr)
+			}
+			return newMockSeriesSet(m.classicSeries...)
+		}
+		// If passthroughSeries is set, use it for non-histogram metric queries
+		if len(m.passthroughSeries) > 0 {
+			return newMockSeriesSet(m.passthroughSeries...)
+		}
+		// Base metric name query - return NHCB series
+		if m.nhcbErr != nil {
+			return storage.ErrSeriesSet(m.nhcbErr)
+		}
+		return &mockSeriesSet{idx: -1, series: m.nhcbSeries, warnings: m.nhcbWarnings}
 	}
 	return newMockSeriesSet()
 }
@@ -768,7 +779,10 @@ func (m *nhcbSetQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHint
 				strings.HasSuffix(matcher.Value, "_sum") {
 				return m.classicSet
 			}
-			return m.nhcbSet
+			if m.nhcbSet != nil {
+				return m.nhcbSet
+			}
+			return m.classicSet
 		}
 	}
 	return newMockSeriesSet()
@@ -829,12 +843,16 @@ func TestQuerier_ToClassicErrorPropagation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			q := NewQuerier(tc.querier, []Representation{NHCB})
-			ss := q.Select(context.Background(), false, nil,
-				labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket"))
-			for ss.Next() {
+			for _, matchers := range [][]*labels.Matcher{
+				{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket")},
+				{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket"), labels.MustNewMatcher(labels.MatchEqual, labels.BucketLabel, "1.0")},
+			} {
+				q := NewQuerier(tc.querier, []Representation{NHCB})
+				ss := q.Select(context.Background(), false, nil, matchers...)
+				for ss.Next() {
+				}
+				require.ErrorIs(t, ss.Err(), testError)
 			}
-			require.ErrorIs(t, ss.Err(), testError)
 		})
 	}
 }
@@ -855,18 +873,22 @@ func TestQuerier_ToClassicWarningPropagation(t *testing.T) {
 
 	t.Run("nhcb set warnings propagate", func(t *testing.T) {
 		warn := annotations.New().Add(errors.New("nhcb warning"))
-		q := NewQuerier(&nhcbMockQuerier{
-			classicSeries: []storage.Series{},
-			nhcbSeries:    []storage.Series{nhcbSeries},
-			nhcbWarnings:  warn,
-		}, []Representation{NHCB})
+		for _, matchers := range [][]*labels.Matcher{
+			{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket")},
+			{labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket"), labels.MustNewMatcher(labels.MatchEqual, labels.BucketLabel, "1.0")},
+		} {
+			q := NewQuerier(&nhcbMockQuerier{
+				classicSeries: []storage.Series{},
+				nhcbSeries:    []storage.Series{nhcbSeries},
+				nhcbWarnings:  warn,
+			}, []Representation{NHCB})
 
-		ss := q.Select(context.Background(), false, nil,
-			labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket"))
-		for ss.Next() {
+			ss := q.Select(context.Background(), false, nil, matchers...)
+			for ss.Next() {
+			}
+			require.NoError(t, ss.Err())
+			require.Equal(t, warn, ss.Warnings())
 		}
-		require.NoError(t, ss.Err())
-		require.Equal(t, warn, ss.Warnings())
 	})
 
 	t.Run("classic set warnings propagate", func(t *testing.T) {
@@ -877,7 +899,6 @@ func TestQuerier_ToClassicWarningPropagation(t *testing.T) {
 		)}
 		q := NewQuerier(&nhcbSetQuerier{
 			classicSet: &mockSeriesSet{idx: -1, series: classicSeries, warnings: warn},
-			nhcbSet:    newMockSeriesSet(),
 		}, []Representation{NHCB})
 
 		ss := q.Select(context.Background(), false, nil,

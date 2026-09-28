@@ -17,6 +17,8 @@ import (
 	"context"
 	"slices"
 
+	"github.com/prometheus/common/model"
+
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -92,7 +94,7 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, hints *storage.Se
 		return q.Querier.Select(ctx, sortSeries, hints, sel.matchers...)
 	}
 	s := &seriesSet{sel: sel, storedSet: q.Querier.Select(ctx, false, hints, sel.matchers...)}
-	if sel.from != 0 {
+	if len(sel.sourceMatchers) > 0 {
 		s.sourceSet = q.Querier.Select(ctx, false, hints, sel.sourceMatchers...)
 	}
 	return s
@@ -123,8 +125,8 @@ func (s *series) storageSeries() storage.Series {
 // them.
 type seriesSet struct {
 	sel selector
-	// storedSet holds the stored series the selector reads, and sourceSet
-	// the series to convert from, nil if nothing is converted.
+	// storedSet holds the stored series the selector reads, and also the
+	// series to convert from if sourceSet is nil.
 	storedSet, sourceSet storage.SeriesSet
 
 	// it, h and fh are reused to read the samples of stored series.
@@ -165,13 +167,13 @@ func (s *seriesSet) Warnings() annotations.Annotations { return s.warnings }
 // load reads the stored series and the ones to convert from, converts them,
 // and lets the stored data win.
 func (s *seriesSet) load() ([]storage.Series, error) {
-	stored, err := s.readStored()
+	stored, sources, err := s.readSeries()
 	if err != nil {
 		return nil, err
 	}
 	var converted []*series
-	if s.sourceSet != nil {
-		if converted, err = s.convert(); err != nil {
+	if len(sources) > 0 {
+		if converted, err = s.convert(sources); err != nil {
 			return nil, err
 		}
 	}
@@ -194,43 +196,62 @@ func (s *seriesSet) load() ([]storage.Series, error) {
 	return out, nil
 }
 
-// readStored returns the stored series the selector reads. Unless their
-// samples are filtered by representation, they are returned unchanged.
-func (s *seriesSet) readStored() ([]*series, error) {
+// readSeries returns the stored series the selector reads, and the series to
+// convert from. Unless the samples of the stored series are filtered by
+// representation, they are returned unchanged.
+func (s *seriesSet) readSeries() (stored []*series, sources []storage.Series, err error) {
 	var (
-		out    []*series
-		ss     = s.storedSet
 		filter = s.sel.stored != allRepresentations || s.sel.debug
 		split  = storedSplitter{stored: s.sel.stored, debug: s.sel.debug}
 	)
-	for ss.Next() {
-		if !filter {
-			out = append(out, &series{lset: ss.At().Labels(), stored: ss.At()})
+	for s.storedSet.Next() {
+		ser := s.storedSet.At()
+		lset := ser.Labels()
+		if s.sel.from != 0 && lset.Get(model.MetricNameLabel) != s.sel.name {
+			sources = append(sources, ser)
 			continue
 		}
-		parts, err := split.split(ss.At())
-		if err != nil {
-			return nil, err
+		if s.sel.suffix == "" && !matches(lset.Get(labels.BucketLabel), s.sel.leMatchers) {
+			continue
 		}
-		out = append(out, parts...)
+		if !filter {
+			stored = append(stored, &series{lset: lset, stored: ser})
+			continue
+		}
+		parts, err := split.split(ser)
+		if err != nil {
+			return nil, nil, err
+		}
+		stored = append(stored, parts...)
 	}
-	s.warnings.Merge(ss.Warnings())
-	return out, ss.Err()
+	s.warnings.Merge(s.storedSet.Warnings())
+	if err := s.storedSet.Err(); err != nil {
+		return nil, nil, err
+	}
+	if s.sourceSet != nil {
+		for s.sourceSet.Next() {
+			sources = append(sources, s.sourceSet.At())
+		}
+		s.warnings.Merge(s.sourceSet.Warnings())
+		if err := s.sourceSet.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
+	return stored, sources, nil
 }
 
 // convert converts the series to convert from.
-func (s *seriesSet) convert() ([]*series, error) {
+func (s *seriesSet) convert(sources []storage.Series) ([]*series, error) {
 	var (
 		converted []*series
 		warnings  annotations.Annotations
 		err       error
 	)
 	if s.sel.suffix != "" {
-		converted, warnings, err = toClassic(s.sourceSet, s.sel.suffix, s.sel.from, s.sel.leMatchers, s.sel.debug)
+		converted, warnings, err = toClassic(sources, s.sel.suffix, s.sel.from, s.sel.leMatchers, s.sel.debug)
 	} else {
-		converted, warnings, err = toNHCB(s.sourceSet, s.sel.debug)
+		converted, warnings, err = toNHCB(sources, s.sel.debug)
 	}
 	s.warnings.Merge(warnings)
-	s.warnings.Merge(s.sourceSet.Warnings())
 	return converted, err
 }

@@ -55,8 +55,8 @@ type classicHistogram struct {
 }
 
 // toNHCB converts the classic histogram series (_bucket, _count and _sum) of
-// ss to NHCB, one per label set without the le label. A classic histogram that
-// cannot be converted at a timestamp, e.g. because its buckets are not
+// sources to NHCB, one per label set without the le label. A classic histogram
+// that cannot be converted at a timestamp, e.g. because its buckets are not
 // cumulative, is skipped and reported in the returned annotations. In debug
 // mode, the converted series have the StoredAsLabel, set to Classic.
 //
@@ -65,15 +65,14 @@ type classicHistogram struct {
 // because the bucket layout changed. Converted samples other than staleness
 // markers have the latest start timestamp of the classic histogram samples
 // they were converted from.
-func toNHCB(ss storage.SeriesSet, debug bool) ([]*series, annotations.Annotations, error) {
+func toNHCB(sources []storage.Series, debug bool) ([]*series, annotations.Annotations, error) {
 	var (
 		groups   []*nhcbGroup
 		byHash   = make(map[uint64][]int)
 		it       chunkenc.Iterator
 		warnings annotations.Annotations
 	)
-	for ss.Next() {
-		s := ss.At()
+	for _, s := range sources {
 		lset := s.Labels()
 		suffixType, baseName := convertnhcb.GetHistogramMetricBaseName(lset.Get(model.MetricNameLabel))
 		if suffixType == convertnhcb.SuffixNone {
@@ -126,9 +125,6 @@ func toNHCB(ss storage.SeriesSet, debug bool) ([]*series, annotations.Annotation
 		if err := it.Err(); err != nil {
 			return nil, warnings, err
 		}
-	}
-	if err := ss.Err(); err != nil {
-		return nil, warnings, err
 	}
 
 	converted := make([]*series, 0, len(groups))

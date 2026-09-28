@@ -58,12 +58,12 @@ func TestNewSelector(t *testing.T) {
 		err              error
 	}{
 		{
-			name:           "classic buckets",
-			matchers:       []*labels.Matcher{name(labels.MatchEqual, "foo_bucket")},
-			convertFrom:    all,
-			from:           newRepresentations(NHCB, NHE),
-			sourceMatchers: []string{`__name__="foo"`},
-			suffix:         "_bucket",
+			name:             "classic buckets",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo_bucket")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__name__=~"foo(|_bucket)"`},
+			from:             newRepresentations(NHCB, NHE),
+			suffix:           "_bucket",
 		},
 		{
 			name:           "classic count with le and other matchers",
@@ -75,30 +75,39 @@ func TestNewSelector(t *testing.T) {
 			leMatchers:     []string{`le="1.0"`},
 		},
 		{
+			name:           "classic buckets with invalid UTF-8 in the name",
+			matchers:       []*labels.Matcher{name(labels.MatchEqual, "foo\xff_bucket")},
+			convertFrom:    all,
+			from:           newRepresentations(NHCB, NHE),
+			sourceMatchers: []string{`__name__="foo\xff"`},
+			suffix:         "_bucket",
+		},
+		{
 			name:        "classic sum without native histograms to convert from",
 			matchers:    []*labels.Matcher{name(labels.MatchEqual, "foo_sum")},
 			convertFrom: newRepresentations(Classic),
 		},
 		{
-			name:           "native histogram",
-			matchers:       []*labels.Matcher{name(labels.MatchEqual, "foo"), job},
-			convertFrom:    all,
-			from:           newRepresentations(Classic),
-			sourceMatchers: []string{`job="a"`, `__name__=~"foo(_bucket|_count|_sum)"`},
+			name:             "native histogram",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo"), job},
+			convertFrom:      all,
+			expectedMatchers: []string{`job="a"`, `__name__=~"foo(|_bucket|_count|_sum)"`},
+			from:             newRepresentations(Classic),
 		},
 		{
-			name:           "native histogram with regexp meta characters in the name",
-			matchers:       []*labels.Matcher{name(labels.MatchEqual, "foo.bar")},
-			convertFrom:    all,
-			from:           newRepresentations(Classic),
-			sourceMatchers: []string{`__name__=~"foo\\.bar(_bucket|_count|_sum)"`},
+			name:             "native histogram with regexp meta characters in the name",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo.bar")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__name__=~"foo\\.bar(|_bucket|_count|_sum)"`},
+			from:             newRepresentations(Classic),
 		},
 		{
-			name:           "native histogram with a le matcher matching the empty value",
-			matchers:       []*labels.Matcher{name(labels.MatchEqual, "foo"), le(labels.MatchNotEqual, "1.0")},
-			convertFrom:    all,
-			from:           newRepresentations(Classic),
-			sourceMatchers: []string{`__name__=~"foo(_bucket|_count|_sum)"`},
+			name:             "native histogram with a le matcher matching the empty value",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo"), le(labels.MatchNotEqual, "1.0")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__name__=~"foo(|_bucket|_count|_sum)"`},
+			from:             newRepresentations(Classic),
+			leMatchers:       []string{`le!="1.0"`},
 		},
 		{
 			name:        "native histogram with a le matcher not matching the empty value",
@@ -116,11 +125,11 @@ func TestNewSelector(t *testing.T) {
 			convertFrom: all,
 		},
 		{
-			name:           "suffix without a base name",
-			matchers:       []*labels.Matcher{name(labels.MatchEqual, "_bucket")},
-			convertFrom:    all,
-			from:           newRepresentations(Classic),
-			sourceMatchers: []string{`__name__=~"_bucket(_bucket|_count|_sum)"`},
+			name:             "suffix without a base name",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "_bucket")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__name__=~"_bucket(|_bucket|_count|_sum)"`},
+			from:             newRepresentations(Classic),
 		},
 		{
 			name:        "regexp name matcher",
@@ -143,20 +152,19 @@ func TestNewSelector(t *testing.T) {
 			convertFrom: all,
 		},
 		{
-			name:           "stored_as matchers are passed on",
-			matchers:       []*labels.Matcher{name(labels.MatchEqual, "foo_bucket"), labels.MustNewMatcher(labels.MatchEqual, StoredAsLabel, "nhcb")},
-			convertFrom:    all,
-			from:           newRepresentations(NHCB, NHE),
-			sourceMatchers: []string{`__stored_as__="nhcb"`, `__name__="foo"`},
-			suffix:         "_bucket",
+			name:             "stored_as matchers are passed on",
+			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo_bucket"), labels.MustNewMatcher(labels.MatchEqual, StoredAsLabel, "nhcb")},
+			convertFrom:      all,
+			expectedMatchers: []string{`__stored_as__="nhcb"`, `__name__=~"foo(|_bucket)"`},
+			from:             newRepresentations(NHCB, NHE),
+			suffix:           "_bucket",
 		},
 		{
 			name:             "convert matcher overrides the representations to convert from",
 			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo_bucket"), convert(labels.MatchEqual, "nhe")},
-			expectedMatchers: []string{`__name__="foo_bucket"`},
+			expectedMatchers: []string{`__name__=~"foo(|_bucket)"`},
 			stored:           []Representation{NHE},
 			from:             newRepresentations(NHE),
-			sourceMatchers:   []string{`__name__="foo"`},
 			suffix:           "_bucket",
 		},
 		{
@@ -169,19 +177,17 @@ func TestNewSelector(t *testing.T) {
 		{
 			name:             "convert regexp matcher",
 			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo_bucket"), convert(labels.MatchRegexp, "classic|nhcb")},
-			expectedMatchers: []string{`__name__="foo_bucket"`},
+			expectedMatchers: []string{`__name__=~"foo(|_bucket)"`},
 			stored:           []Representation{Classic, NHCB},
 			from:             newRepresentations(NHCB),
-			sourceMatchers:   []string{`__name__="foo"`},
 			suffix:           "_bucket",
 		},
 		{
 			name:             "convert matcher for a native histogram",
 			matchers:         []*labels.Matcher{job, name(labels.MatchEqual, "foo"), convert(labels.MatchEqual, "classic")},
-			expectedMatchers: []string{`job="a"`, `__name__="foo"`},
+			expectedMatchers: []string{`job="a"`, `__name__=~"foo(|_bucket|_count|_sum)"`},
 			stored:           []Representation{Classic},
 			from:             newRepresentations(Classic),
-			sourceMatchers:   []string{`job="a"`, `__name__=~"foo(_bucket|_count|_sum)"`},
 		},
 		{
 			name:             "several convert matchers must all match",
@@ -234,10 +240,9 @@ func TestNewSelector(t *testing.T) {
 			name:             "debug",
 			matchers:         []*labels.Matcher{name(labels.MatchEqual, "foo_bucket"), debug(labels.MatchEqual, "true")},
 			convertFrom:      newRepresentations(NHCB),
-			expectedMatchers: []string{`__name__="foo_bucket"`},
+			expectedMatchers: []string{`__name__=~"foo(|_bucket)"`},
 			debug:            true,
 			from:             newRepresentations(NHCB),
-			sourceMatchers:   []string{`__name__="foo"`},
 			suffix:           "_bucket",
 		},
 		{
@@ -302,6 +307,11 @@ func TestNewSelector(t *testing.T) {
 			require.Equal(t, tc.sourceMatchers, matcherStrings(sel.sourceMatchers))
 			require.Equal(t, tc.suffix, sel.suffix)
 			require.Equal(t, tc.leMatchers, matcherStrings(sel.leMatchers))
+			if sel.from != 0 && len(sel.sourceMatchers) == 0 {
+				// The combined regexp matcher must decompose into exact set
+				// matches so the TSDB looks up postings directly.
+				require.NotEmpty(t, sel.matchers[len(sel.matchers)-1].SetMatches())
+			}
 		})
 	}
 }

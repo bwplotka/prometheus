@@ -346,7 +346,9 @@ or interpolated, but:
 
 ### Performance
 
-* Every converted selector does one more select.
+* Only converted selectors for classic series with `le` matchers do a second select, as only the stored series can be
+  filtered by `le` in the storage; all other converted selectors select both the stored series and the series to
+  convert from in one select.
 * Conversions, and selectors with control matchers, buffer the samples they read, the classic side all native
   histograms of the selector, as the derived buckets depend on all of them. That memory is not accounted in
   `--query.max-samples` yet, and should be.

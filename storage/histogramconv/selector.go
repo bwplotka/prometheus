@@ -25,9 +25,9 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 )
 
-// classicSuffixesPattern matches the suffixes of the classic histogram series
-// that are assembled into a single NHCB series.
-const classicSuffixesPattern = "(_bucket|_count|_sum)"
+// classicSuffixesPattern matches the empty suffix and the suffixes of the
+// classic histogram series that are assembled into a single NHCB series.
+const classicSuffixesPattern = "(|_bucket|_count|_sum)"
 
 // errOnlyControlMatchers is returned for selectors whose only matchers that do
 // not match the empty value are control matchers, as the storage would select
@@ -37,8 +37,9 @@ var errOnlyControlMatchers = fmt.Errorf("vector selector must contain at least o
 
 // selector is the parsed matchers of a Select call.
 type selector struct {
-	// matchers select the stored series. They are the matchers of the
-	// Select call without the control matchers.
+	// matchers select the stored series, and also the series to convert
+	// from if sourceMatchers is empty. They are the matchers of the Select
+	// call without the control matchers.
 	matchers []*labels.Matcher
 	// stored holds the representations of the stored samples to return. The
 	// stored samples of other representations are dropped.
@@ -50,14 +51,18 @@ type selector struct {
 	// representations that can be converted to what the selector selects, and
 	// it is empty if nothing is converted.
 	from representations
-	// sourceMatchers select the series to convert from.
+	// name is the metric name of the stored series.
+	name string
+	// sourceMatchers select the series to convert from if they cannot be
+	// selected together with the stored series by matchers.
 	sourceMatchers []*labels.Matcher
 	// suffix is the suffix of the classic histogram series the selector
 	// selects, e.g. _bucket. It is empty if the selector selects native
 	// histograms.
 	suffix string
-	// leMatchers are the le matchers of a selector for classic histogram
-	// series. They are applied to the converted series.
+	// leMatchers are the le matchers of the selector. They are applied to
+	// the converted classic histogram series, or to the stored native
+	// histogram series.
 	leMatchers []*labels.Matcher
 }
 
@@ -92,6 +97,10 @@ func (sel selector) passThrough() bool {
 //     classic histogram series of that name. As native histograms have no le
 //     label, nothing is converted if a le matcher does not match the empty
 //     value.
+//
+// Unless a selector for classic histogram series has le matchers, which only
+// the stored series can be filtered with in the storage, matchers selects both
+// the stored series and the series to convert from in a single Select call.
 func newSelector(matchers []*labels.Matcher, convertFrom representations) (selector, error) {
 	sel := selector{matchers: matchers, stored: allRepresentations}
 
@@ -153,8 +162,16 @@ func newSelector(matchers []*labels.Matcher, convertFrom representations) (selec
 		if sel.from == 0 {
 			return sel, nil
 		}
+		sel.name = name.Value
 		sel.suffix = suffix
 		sel.leMatchers = le
+		if len(le) == 0 {
+			// Names with invalid UTF-8 can't be matched by a regular expression.
+			if m, err := labels.NewMatcher(labels.MatchRegexp, model.MetricNameLabel, regexp.QuoteMeta(base)+"(|"+suffix+")"); err == nil {
+				sel.matchers = append(other, m)
+				return sel, nil
+			}
+		}
 		sel.sourceMatchers = append(other, labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, base))
 		return sel, nil
 	}
@@ -173,7 +190,9 @@ func newSelector(matchers []*labels.Matcher, convertFrom representations) (selec
 		return sel, nil
 	}
 	sel.from = Classic.bit()
-	sel.sourceMatchers = append(other, classicName)
+	sel.name = name.Value
+	sel.leMatchers = le
+	sel.matchers = append(other, classicName)
 	return sel, nil
 }
 
@@ -186,16 +205,22 @@ func isControlMatcher(m *labels.Matcher) bool {
 // all matchers.
 func matchingRepresentations(matchers []*labels.Matcher) representations {
 	var s representations
-Representations:
 	for _, r := range Representations() {
-		for _, m := range matchers {
-			if !m.Matches(string(r)) {
-				continue Representations
-			}
+		if matches(string(r), matchers) {
+			s |= r.bit()
 		}
-		s |= r.bit()
 	}
 	return s
+}
+
+// matches reports whether v matches all matchers.
+func matches(v string, matchers []*labels.Matcher) bool {
+	for _, m := range matchers {
+		if !m.Matches(v) {
+			return false
+		}
+	}
+	return true
 }
 
 // classicBaseName returns the base name and the suffix of the name of a classic
