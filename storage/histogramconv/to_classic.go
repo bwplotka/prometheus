@@ -28,20 +28,20 @@ import (
 )
 
 // toClassic converts the native histograms of sources, of the representations
-// in from, to the classic histogram series with the given suffix, and returns
-// the converted series whose le label matches all leMatchers. In debug mode,
-// the converted series have the StoredAsLabel, set to the representation of
-// the native histograms they were converted from. An invalid native histogram,
-// e.g. with fewer buckets than its spans need, is skipped and reported in the
-// returned annotations.
+// in s.sel.from, to the classic histogram series with s.sel.suffix, and
+// returns the converted series whose le label matches all s.sel.leMatchers. In
+// debug mode, the converted series have the StoredAsLabel, set to the
+// representation of the native histograms they were converted from. If
+// collectWarnings is true, an invalid native histogram, e.g. with fewer
+// buckets than its spans need, is reported in s.warnings.
 //
 // Native histograms with an exponential schema have no fixed bucket
 // boundaries. So that the resulting classic histograms can be aggregated by
 // le, across series and over time, all of them are converted with the same
-// derived boundaries, see exponentialBoundaries. Hence the le set depends on
-// the selected series and time range, a single low resolution histogram lowers
-// the resolution of all of them, and histograms with many buckets result in
-// many classic series.
+// derived boundaries in s.boundaries, see exponentialBoundaries. Hence the le
+// set depends on the selected series and time range, a single low resolution
+// histogram lowers the resolution of all of them, and histograms with many
+// buckets result in many classic series.
 //
 // A converted series is marked stale at the first sample of its native
 // histogram that does not result in it anymore, e.g. because the native
@@ -49,105 +49,67 @@ import (
 // like the scrape loop marks series stale that disappear from a target.
 // Converted samples other than staleness markers have the start timestamp of
 // the native histogram sample they were converted from.
-func toClassic(sources []storage.Series, suffix string, from representations, leMatchers []*labels.Matcher, debug bool) ([]*series, annotations.Annotations, error) {
-	nhSeries, warnings, err := readNativeHistograms(sources, from)
-	if err != nil {
-		return nil, warnings, err
-	}
-	var boundaries []float64
-	if from.has(NHE) && suffix == histogram.ClassicSuffixBucket {
-		boundaries = exponentialBoundaries(nhSeries)
+func (s *seriesSet) toClassic(sources []storage.Series, collectWarnings bool) ([]*series, error) {
+	b := s.classicBuilder
+	if b == nil {
+		b = newClassicSeriesBuilder()
+		s.classicBuilder = b
+	} else {
+		b.reset()
 	}
 
-	lsetBuilder := labels.NewBuilder(labels.EmptyLabels())
-	b := newClassicSeriesBuilder()
-	for _, ns := range nhSeries {
+	for _, ser := range sources {
+		lset := ser.Labels()
 		// A cache drops its label sets when the labels change, so debug
 		// mode, which adds the representation to the labels, uses one per
 		// representation.
 		var (
-			nhcbLabels, nheLabels = ns.labels, ns.labels
-			nhcbCache             = &histogram.ClassicSeriesCache{}
+			nhcbLabels, nheLabels = lset, lset
+			nhcbCache             = &b.nhcbCache
 			nheCache              = nhcbCache
 		)
-		if debug {
-			nhcbLabels, nheLabels = withStoredAs(ns.labels, NHCB), withStoredAs(ns.labels, NHE)
-			nheCache = &histogram.ClassicSeriesCache{}
+		if s.sel.debug {
+			nhcbLabels, nheLabels = withStoredAs(lset, NHCB), withStoredAs(lset, NHE)
+			nheCache = &b.nheCache
 		}
 		b.startSeries()
-		for _, smpl := range ns.samples {
-			b.startSample(smpl.st, smpl.t)
-			if smpl.fh != nil {
-				var err error
-				if histogram.IsExponentialSchema(smpl.fh.Schema) {
-					err = histogram.ConvertExponentialToClassic(smpl.fh, boundaries, nheLabels, lsetBuilder, suffix, nheCache, b.emit)
-				} else {
-					err = histogram.ConvertNHCBToClassic(smpl.fh, nhcbLabels, lsetBuilder, suffix, nhcbCache, b.emit)
-				}
-				if err != nil {
-					return nil, warnings, err
+		s.it = ser.Iterator(s.it)
+		for valType := s.it.Next(); valType != chunkenc.ValNone; valType = s.it.Next() {
+			b.startSample(s.it.AtST(), s.it.AtT())
+			if valType == chunkenc.ValHistogram || valType == chunkenc.ValFloatHistogram {
+				// This works for histograms with integer counts, too.
+				if _, s.fh = s.it.AtFloatHistogram(s.fh); convertible(s.fh, s.sel.from) {
+					if err := s.fh.Validate(); err != nil {
+						if collectWarnings {
+							s.warnings.Add(annotations.NewNativeToClassicConversionWarning(lset.Get(model.MetricNameLabel), err))
+						}
+					} else {
+						var err error
+						if histogram.IsExponentialSchema(s.fh.Schema) {
+							err = histogram.ConvertExponentialToClassic(s.fh, s.boundaries, nheLabels, b.lsetBuilder, s.sel.suffix, nheCache, b.emit)
+						} else {
+							err = histogram.ConvertNHCBToClassic(s.fh, nhcbLabels, b.lsetBuilder, s.sel.suffix, nhcbCache, b.emit)
+						}
+						if err != nil {
+							return nil, err
+						}
+					}
 				}
 			}
 			b.endSample()
 		}
+		if err := s.it.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	converted := make([]*series, 0, len(b.series))
-	for _, s := range b.series {
-		if matches(s.lset.Get(labels.BucketLabel), leMatchers) {
-			converted = append(converted, s)
+	for _, ser := range b.series {
+		if matches(ser.lset.Get(labels.BucketLabel), s.sel.leMatchers) {
+			converted = append(converted, ser)
 		}
 	}
-	return converted, warnings, nil
-}
-
-// nativeHistogramSeries holds the samples of a native histogram series.
-type nativeHistogramSeries struct {
-	labels  labels.Labels
-	samples []nativeHistogramSample
-}
-
-// nativeHistogramSample is a sample of a native histogram series, with its
-// start timestamp st. fh is the histogram to convert, nil if the sample is not
-// converted, e.g. a staleness marker.
-type nativeHistogramSample struct {
-	st, t int64
-	fh    *histogram.FloatHistogram
-}
-
-// readNativeHistograms reads the samples of sources. Only the native
-// histograms of the representations in from are converted, and only if they
-// are valid, as the conversion might panic otherwise. Invalid ones are
-// reported in the returned annotations.
-func readNativeHistograms(sources []storage.Series, from representations) ([]nativeHistogramSeries, annotations.Annotations, error) {
-	var (
-		nhSeries = make([]nativeHistogramSeries, 0, len(sources))
-		it       chunkenc.Iterator
-		warnings annotations.Annotations
-	)
-	for _, s := range sources {
-		ns := nativeHistogramSeries{labels: s.Labels()}
-		it = s.Iterator(it)
-		for valType := it.Next(); valType != chunkenc.ValNone; valType = it.Next() {
-			smpl := nativeHistogramSample{st: it.AtST(), t: it.AtT()}
-			if valType == chunkenc.ValHistogram || valType == chunkenc.ValFloatHistogram {
-				// This works for histograms with integer counts, too.
-				if _, fh := it.AtFloatHistogram(nil); convertible(fh, from) {
-					if err := fh.Validate(); err != nil {
-						warnings.Add(annotations.NewNativeToClassicConversionWarning(ns.labels.Get(model.MetricNameLabel), err))
-					} else {
-						smpl.fh = fh
-					}
-				}
-			}
-			ns.samples = append(ns.samples, smpl)
-		}
-		if err := it.Err(); err != nil {
-			return nil, warnings, err
-		}
-		nhSeries = append(nhSeries, ns)
-	}
-	return nhSeries, warnings, nil
+	return converted, nil
 }
 
 // convertible reports whether the native histogram fh, of the representations
@@ -163,40 +125,63 @@ func convertible(fh *histogram.FloatHistogram, from representations) bool {
 }
 
 // exponentialBoundaries returns the le boundaries to convert the exponential
-// native histograms amongst nhSeries with: the union of the boundaries of all
+// native histograms amongst s.groups with: the union of the boundaries of all
 // of them, see histogram.AppendClassicBoundaries, reduced to the lowest schema
 // amongst them. As the boundaries of a lower schema are boundaries of every
 // higher schema, too, the conversion is exact for each histogram. As all of
 // them are converted with the same boundaries, the resulting classic
 // histograms can be aggregated by le, across series and over time.
-func exponentialBoundaries(nhSeries []nativeHistogramSeries) []float64 {
+func (s *seriesSet) exponentialBoundaries() ([]float64, error) {
 	minSchema := int32(math.MaxInt32)
-	for _, ns := range nhSeries {
-		for _, smpl := range ns.samples {
-			if smpl.fh != nil && histogram.IsExponentialSchema(smpl.fh.Schema) {
-				minSchema = min(minSchema, smpl.fh.Schema)
+	for _, g := range s.groups {
+		for _, ser := range g.sources {
+			s.it = ser.Iterator(s.it)
+			for valType := s.it.Next(); valType != chunkenc.ValNone; valType = s.it.Next() {
+				if valType != chunkenc.ValHistogram && valType != chunkenc.ValFloatHistogram {
+					continue
+				}
+				_, s.fh = s.it.AtFloatHistogram(s.fh)
+				if histogram.IsExponentialSchema(s.fh.Schema) && convertible(s.fh, s.sel.from) && s.fh.Validate() == nil {
+					minSchema = min(minSchema, s.fh.Schema)
+				}
+			}
+			if err := s.it.Err(); err != nil {
+				return nil, err
 			}
 		}
+	}
+	if minSchema == math.MaxInt32 {
+		return nil, nil
 	}
 
 	var boundaries []float64
-	for _, ns := range nhSeries {
-		for _, smpl := range ns.samples {
-			if smpl.fh == nil || !histogram.IsExponentialSchema(smpl.fh.Schema) {
-				continue
+	for _, g := range s.groups {
+		for _, ser := range g.sources {
+			s.it = ser.Iterator(s.it)
+			for valType := s.it.Next(); valType != chunkenc.ValNone; valType = s.it.Next() {
+				if valType != chunkenc.ValHistogram && valType != chunkenc.ValFloatHistogram {
+					continue
+				}
+				_, s.fh = s.it.AtFloatHistogram(s.fh)
+				if !histogram.IsExponentialSchema(s.fh.Schema) || !convertible(s.fh, s.sel.from) || s.fh.Validate() != nil {
+					continue
+				}
+				fh := s.fh
+				if fh.Schema > minSchema {
+					fh = fh.CopyToSchema(minSchema)
+				}
+				boundaries = histogram.AppendClassicBoundaries(boundaries, fh)
 			}
-			fh := smpl.fh
-			if fh.Schema > minSchema {
-				fh = fh.CopyToSchema(minSchema)
+			if err := s.it.Err(); err != nil {
+				return nil, err
 			}
-			boundaries = histogram.AppendClassicBoundaries(boundaries, fh)
+			// The samples of a series mostly have the same buckets, so drop the
+			// duplicates after each series already.
+			slices.Sort(boundaries)
+			boundaries = slices.Compact(boundaries)
 		}
-		// The samples of a series mostly have the same buckets, so drop the
-		// duplicates after each series already.
-		slices.Sort(boundaries)
-		boundaries = slices.Compact(boundaries)
 	}
-	return boundaries
+	return boundaries, nil
 }
 
 // classicSeriesBuilder collects the classic histogram series converted from
@@ -210,6 +195,12 @@ type classicSeriesBuilder struct {
 	series []*series
 	// byHash indexes series by label hash rather than by Labels.String().
 	byHash map[uint64][]int
+	// pool holds reusable fSample slices from previous groups whose
+	// iterators are no longer in use.
+	pool [][]fSample
+
+	lsetBuilder         *labels.Builder
+	nhcbCache, nheCache histogram.ClassicSeriesCache
 
 	// st and t are the start timestamp and the timestamp of the current
 	// sample.
@@ -220,7 +211,25 @@ type classicSeriesBuilder struct {
 }
 
 func newClassicSeriesBuilder() *classicSeriesBuilder {
-	return &classicSeriesBuilder{byHash: make(map[uint64][]int)}
+	return &classicSeriesBuilder{
+		byHash:      make(map[uint64][]int),
+		lsetBuilder: labels.NewBuilder(labels.EmptyLabels()),
+	}
+}
+
+// reset prepares b for the next histogramGroup, recycling any fSample slices
+// that are not in use by an active iterator.
+func (b *classicSeriesBuilder) reset() {
+	for _, s := range b.series {
+		if s.inUse == 0 && cap(s.floats) > 0 {
+			b.pool = append(b.pool, s.floats[:0])
+		}
+	}
+	clear(b.series)
+	b.series = b.series[:0]
+	clear(b.byHash)
+	b.emitted = b.emitted[:0]
+	b.prevEmitted = b.prevEmitted[:0]
 }
 
 // startSeries prepares for the samples of the next native histogram series.
@@ -239,21 +248,30 @@ func (b *classicSeriesBuilder) startSample(st, t int64) {
 // start timestamp, to the series with labels l. It is the emitSeriesFn of the
 // conversion functions.
 func (b *classicSeriesBuilder) emit(l labels.Labels, v float64) error {
-	h := l.Hash()
 	idx := -1
-	for _, candidate := range b.byHash[h] {
-		if labels.Equal(b.series[candidate].lset, l) {
-			idx = candidate
-			break
+	if i := len(b.emitted); i < len(b.prevEmitted) && labels.Equal(b.series[b.prevEmitted[i]].lset, l) {
+		idx = b.prevEmitted[i]
+	} else {
+		h := l.Hash()
+		for _, candidate := range b.byHash[h] {
+			if labels.Equal(b.series[candidate].lset, l) {
+				idx = candidate
+				break
+			}
+		}
+		if idx == -1 {
+			idx = len(b.series)
+			b.byHash[h] = append(b.byHash[h], idx)
+			var floats []fSample
+			if n := len(b.pool); n > 0 {
+				floats = b.pool[n-1]
+				b.pool = b.pool[:n-1]
+			}
+			b.series = append(b.series, &series{lset: l, floats: floats})
 		}
 	}
-	if idx == -1 {
-		idx = len(b.series)
-		b.byHash[h] = append(b.byHash[h], idx)
-		b.series = append(b.series, &series{lset: l})
-	}
 
-	b.series[idx].samples = append(b.series[idx].samples, fSample{st: b.st, t: b.t, f: v})
+	b.series[idx].floats = append(b.series[idx].floats, fSample{st: b.st, t: b.t, f: v})
 	b.emitted = append(b.emitted, idx)
 	return nil
 }
@@ -262,8 +280,8 @@ func (b *classicSeriesBuilder) emit(l labels.Labels, v float64) error {
 // current one, stale.
 func (b *classicSeriesBuilder) endSample() {
 	for _, idx := range b.prevEmitted {
-		if samples := b.series[idx].samples; samples[len(samples)-1].T() != b.t {
-			b.series[idx].samples = append(samples, fSample{t: b.t, f: math.Float64frombits(value.StaleNaN)})
+		if floats := b.series[idx].floats; floats[len(floats)-1].t != b.t {
+			b.series[idx].floats = append(floats, fSample{t: b.t, f: math.Float64frombits(value.StaleNaN)})
 		}
 	}
 	b.emitted, b.prevEmitted = b.prevEmitted, b.emitted

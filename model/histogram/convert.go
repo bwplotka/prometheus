@@ -50,14 +50,31 @@ type ClassicSeriesCache struct {
 	// ConvertExponentialToClassic, keyed by bucket boundary, as the set of
 	// boundaries of an exponential histogram may change from sample to sample.
 	exponentialBucketLabels map[float64]labels.Labels
+
+	positiveBuckets []float64
 }
 
 // invalidateIfLabelsChanged drops every cached label set once the cache is
 // reused for a series with other labels.
 func (c *ClassicSeriesCache) invalidateIfLabelsChanged(lset labels.Labels) {
 	if !labels.Equal(c.lset, lset) {
-		*c = ClassicSeriesCache{lset: lset}
+		*c = ClassicSeriesCache{lset: lset, positiveBuckets: c.positiveBuckets[:0]}
 	}
+}
+
+// positiveBucketsBuffer returns a zeroed slice of length n, reusing the buffer
+// of cache if non-nil.
+func positiveBucketsBuffer(cache *ClassicSeriesCache, n int) []float64 {
+	if cache == nil {
+		return make([]float64, n)
+	}
+	if cap(cache.positiveBuckets) < n {
+		cache.positiveBuckets = make([]float64, n)
+	} else {
+		cache.positiveBuckets = cache.positiveBuckets[:n]
+		clear(cache.positiveBuckets)
+	}
+	return cache.positiveBuckets
 }
 
 // bucketsMatch reports whether the cached bucket label sets were built for
@@ -138,7 +155,7 @@ func ConvertNHCBToClassic(nhcb any, lset labels.Labels, lsetBuilder *labels.Buil
 
 		if wantBuckets {
 			customValues = h.CustomValues
-			positiveBuckets = make([]float64, len(customValues)+1)
+			positiveBuckets = positiveBucketsBuffer(cache, len(customValues)+1)
 
 			// Histograms are in delta format so we first bring them to absolute format.
 			acc := int64(0)
@@ -168,7 +185,7 @@ func ConvertNHCBToClassic(nhcb any, lset labels.Labels, lsetBuilder *labels.Buil
 
 		if wantBuckets {
 			customValues = h.CustomValues
-			positiveBuckets = make([]float64, len(customValues)+1)
+			positiveBuckets = positiveBucketsBuffer(cache, len(customValues)+1)
 
 			for _, span := range h.PositiveSpans {
 				// Since Float Histogram is already in absolute format we should

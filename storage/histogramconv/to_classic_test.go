@@ -222,49 +222,90 @@ func TestQuerier_ToClassic(t *testing.T) {
 }
 
 func TestQuerier_ToClassicOrder(t *testing.T) {
-	nhcb := &histogram.Histogram{
-		Schema:          histogram.CustomBucketsSchema,
-		Count:           16,
-		Sum:             100.0,
-		CustomValues:    []float64{1.0, 5.0, 10.0},
-		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 4}},
-		PositiveBuckets: []int64{2, 1, 2, 1},
+	nhcb := func(c int64) *histogram.Histogram {
+		return &histogram.Histogram{
+			Schema:          histogram.CustomBucketsSchema,
+			Count:           uint64(4 * c),
+			Sum:             100.0,
+			CustomValues:    []float64{1.0, 5.0, 10.0},
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 4}},
+			PositiveBuckets: []int64{c, 0, 0, 0},
+		}
 	}
 
 	mock := &nhcbMockQuerier{
 		classicSeries: []storage.Series{},
 		nhcbSeries: []storage.Series{
-			storage.NewListSeries(labels.FromStrings("__name__", "http_requests", "job", "api"), []chunks.Sample{hSample{t: 1, h: nhcb}}),
-			storage.NewListSeries(labels.FromStrings("__name__", "http_requests", "job", "web"), []chunks.Sample{hSample{t: 1, h: nhcb}}),
+			storage.NewListSeries(labels.FromStrings("__name__", "http_requests", "job", "web"), []chunks.Sample{hSample{t: 1, h: nhcb(2)}}),
+			storage.NewListSeries(labels.FromStrings("__name__", "http_requests", "job", "api"), []chunks.Sample{hSample{t: 1, h: nhcb(1)}}),
 		},
 	}
 	q := NewQuerier(mock, []Representation{NHCB})
 
-	// Run the same query multiple times and verify order is consistent.
-	for range 5 {
-		ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket"))
-		var seriesLabels []string
-		for ss.Next() {
-			seriesLabels = append(seriesLabels, ss.At().Labels().String())
-		}
-		require.NoError(t, ss.Err())
+	for _, tc := range []struct {
+		sortSeries    bool
+		expectedOrder []string
+		expectedVals  []float64
+	}{
+		{
+			sortSeries: false,
+			expectedOrder: []string{
+				`{__name__="http_requests_bucket", job="web", le="+Inf"}`,
+				`{__name__="http_requests_bucket", job="web", le="1.0"}`,
+				`{__name__="http_requests_bucket", job="web", le="10.0"}`,
+				`{__name__="http_requests_bucket", job="web", le="5.0"}`,
+				`{__name__="http_requests_bucket", job="api", le="+Inf"}`,
+				`{__name__="http_requests_bucket", job="api", le="1.0"}`,
+				`{__name__="http_requests_bucket", job="api", le="10.0"}`,
+				`{__name__="http_requests_bucket", job="api", le="5.0"}`,
+			},
+			expectedVals: []float64{8, 2, 6, 4, 4, 1, 3, 2},
+		},
+		{
+			sortSeries: true,
+			expectedOrder: []string{
+				`{__name__="http_requests_bucket", job="api", le="+Inf"}`,
+				`{__name__="http_requests_bucket", job="api", le="1.0"}`,
+				`{__name__="http_requests_bucket", job="api", le="10.0"}`,
+				`{__name__="http_requests_bucket", job="api", le="5.0"}`,
+				`{__name__="http_requests_bucket", job="web", le="+Inf"}`,
+				`{__name__="http_requests_bucket", job="web", le="1.0"}`,
+				`{__name__="http_requests_bucket", job="web", le="10.0"}`,
+				`{__name__="http_requests_bucket", job="web", le="5.0"}`,
+			},
+			expectedVals: []float64{4, 1, 3, 2, 8, 2, 6, 4},
+		},
+	} {
+		// Run the same query multiple times and verify order is consistent.
+		for range 5 {
+			ss := q.Select(context.Background(), tc.sortSeries, nil, labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests_bucket"))
+			var (
+				series       []storage.Series
+				seriesLabels []string
+			)
+			for ss.Next() {
+				s := ss.At()
+				series = append(series, s)
+				seriesLabels = append(seriesLabels, s.Labels().String())
+			}
+			require.NoError(t, ss.Err())
+			require.Equal(t, tc.expectedOrder, seriesLabels)
 
-		// 2 NHCB series × 4 buckets each (le=1.0, 5.0, 10.0, +Inf) = 8 series.
-		require.Len(t, seriesLabels, 8)
-
-		// Expect the series sorted by labels, like the storage sorts them,
-		// i.e. by the le values as strings.
-		expectedOrder := []string{
-			`{__name__="http_requests_bucket", job="api", le="+Inf"}`,
-			`{__name__="http_requests_bucket", job="api", le="1.0"}`,
-			`{__name__="http_requests_bucket", job="api", le="10.0"}`,
-			`{__name__="http_requests_bucket", job="api", le="5.0"}`,
-			`{__name__="http_requests_bucket", job="web", le="+Inf"}`,
-			`{__name__="http_requests_bucket", job="web", le="1.0"}`,
-			`{__name__="http_requests_bucket", job="web", le="10.0"}`,
-			`{__name__="http_requests_bucket", job="web", le="5.0"}`,
+			// Open iterators on all series across groups before advancing any
+			// of them, verifying that materializing a later group does not
+			// overwrite samples still in use by an earlier group's iterator.
+			iters := make([]chunkenc.Iterator, len(series))
+			for i, s := range series {
+				iters[i] = s.Iterator(nil)
+			}
+			for i, it := range iters {
+				require.Equal(t, chunkenc.ValFloat, it.Next())
+				_, v := it.At()
+				require.Equal(t, tc.expectedVals[i], v)
+				require.Equal(t, chunkenc.ValNone, it.Next())
+				require.NoError(t, it.Err())
+			}
 		}
-		require.Equal(t, expectedOrder, seriesLabels)
 	}
 }
 

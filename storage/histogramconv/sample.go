@@ -14,10 +14,18 @@
 package histogramconv
 
 import (
+	"cmp"
+	"slices"
+
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 )
+
+type samples []chunks.Sample
+
+func (s samples) Get(i int) chunks.Sample { return s[i] }
+func (s samples) Len() int                { return len(s) }
 
 // fSample is a float sample.
 type fSample struct {
@@ -32,6 +40,95 @@ func (fSample) H() *histogram.Histogram       { panic("H() called for fSample") 
 func (fSample) FH() *histogram.FloatHistogram { panic("FH() called for fSample") }
 func (fSample) Type() chunkenc.ValueType      { return chunkenc.ValFloat }
 func (s fSample) Copy() chunks.Sample         { return s }
+
+// floatSeriesIterator iterates over a slice of fSample without boxing each
+// sample in a chunks.Sample interface value.
+type floatSeriesIterator struct {
+	samples []fSample
+	idx     int
+	owner   *series
+}
+
+func (it *floatSeriesIterator) reset(owner *series, samples []fSample) *floatSeriesIterator {
+	it.samples = samples
+	it.idx = -1
+	it.owner = owner
+	return it
+}
+
+func (it *floatSeriesIterator) release() {
+	if it.owner != nil {
+		it.owner.inUse--
+		it.owner = nil
+	}
+}
+
+func (it *floatSeriesIterator) Next() chunkenc.ValueType {
+	it.idx++
+	if it.idx >= len(it.samples) {
+		it.release()
+		return chunkenc.ValNone
+	}
+	return chunkenc.ValFloat
+}
+
+func (it *floatSeriesIterator) Seek(t int64) chunkenc.ValueType {
+	if it.idx < 0 {
+		it.idx = 0
+	}
+	if it.idx >= len(it.samples) {
+		it.release()
+		return chunkenc.ValNone
+	}
+	if it.samples[it.idx].t >= t {
+		return chunkenc.ValFloat
+	}
+	i, _ := slices.BinarySearchFunc(it.samples[it.idx:], t, func(s fSample, target int64) int {
+		return cmp.Compare(s.t, target)
+	})
+	it.idx += i
+	if it.idx >= len(it.samples) {
+		it.release()
+		return chunkenc.ValNone
+	}
+	return chunkenc.ValFloat
+}
+
+func (it *floatSeriesIterator) At() (int64, float64) {
+	s := it.samples[it.idx]
+	return s.t, s.f
+}
+
+func (*floatSeriesIterator) AtHistogram(*histogram.Histogram) (int64, *histogram.Histogram) {
+	panic("AtHistogram() called for floatSeriesIterator")
+}
+
+func (*floatSeriesIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	panic("AtFloatHistogram() called for floatSeriesIterator")
+}
+
+func (it *floatSeriesIterator) AtT() int64  { return it.samples[it.idx].t }
+func (it *floatSeriesIterator) AtST() int64 { return it.samples[it.idx].st }
+func (*floatSeriesIterator) Err() error     { return nil }
+
+// errIterator is a chunkenc.Iterator that immediately returns err.
+type errIterator struct {
+	err error
+}
+
+func (errIterator) Next() chunkenc.ValueType      { return chunkenc.ValNone }
+func (errIterator) Seek(int64) chunkenc.ValueType { return chunkenc.ValNone }
+func (errIterator) At() (int64, float64)          { return 0, 0 }
+func (errIterator) AtHistogram(*histogram.Histogram) (int64, *histogram.Histogram) {
+	return 0, nil
+}
+
+func (errIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	return 0, nil
+}
+func (errIterator) AtT() int64    { return 0 }
+func (errIterator) AtST() int64   { return 0 }
+func (it errIterator) Err() error { return it.err }
 
 // hSample is a native histogram sample with integer counts.
 type hSample struct {

@@ -256,7 +256,8 @@ its gaps:
   `foo_bucket{__convert_stored_as__="nhcb"}`, return all converted samples, e.g. to compare them with
   `foo_bucket{__convert_stored_as__="classic"}`.
 
-Converted and merged series are sorted by labels, which also fixes the prototype's unsorted output.
+Converted and merged series are sorted by labels within each histogram, and across histograms when sorted series are
+requested.
 
 #### Examples
 
@@ -349,12 +350,13 @@ or interpolated, but:
 * Only converted selectors for classic series with `le` matchers do a second select, as only the stored series can be
   filtered by `le` in the storage; all other converted selectors select both the stored series and the series to
   convert from in one select.
-* Conversions, and selectors with control matchers, buffer the samples they read, the classic side all native
-  histograms of the selector, as the derived buckets depend on all of them. That memory is not accounted in
-  `--query.max-samples` yet, and should be.
-* Letting stored data win needs the timestamps of the stored samples of every histogram that is converted too, so
-  those stored series are read twice. That only costs where a query covers a histogram stored in both
-  representations, e.g. across a migration.
+* Histograms are converted one at a time, reusing the sample buffers of the previous histogram once its iterators are
+  exhausted, so only one histogram's converted series are buffered in memory at once. When converting exponential
+  histograms to `_bucket` series, a streaming pass first computes the shared derived boundaries without keeping the
+  native histograms in memory. Stored series of histograms that have no series to convert from, and need no
+  representation filtering or `__stored_as__` label, are passed through without reading their samples.
+* Letting stored data win needs the timestamps of the stored samples of every histogram that is converted too. That
+  only costs where a query covers a histogram stored in both representations, e.g. across a migration.
 * Select hints could later let the storage skip data that is not converted, as PROM-31 suggested.
 
 ## Alternatives

@@ -26,16 +26,16 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 )
 
-// storedWins lets stored data win over converted data, where the selector
-// reads a histogram both stored and converted, and returns the converted
-// series to return in addition to the stored ones:
+// storedWins lets stored data win over converted data for one histogramGroup,
+// where the selector reads the histogram both stored and converted, and
+// returns the converted series to return in addition to the stored ones:
 //
 //   - A converted sample is dropped where the stored data the selector reads
-//     has a sample of the same histogram at the same timestamp, see
-//     histogramIndex. If the converted sample before it is returned, and not
-//     a staleness marker, a staleness marker is returned instead, so that the
-//     converted series ends where the stored histogram takes over, even if
-//     the stored histogram has other buckets.
+//     has a sample of the same histogram at the same timestamp. If the
+//     converted sample before it is returned, and not a staleness marker, a
+//     staleness marker is returned instead, so that the converted series ends
+//     where the stored histogram takes over, even if the stored histogram has
+//     other buckets.
 //   - Converted series without samples other than staleness markers are
 //     dropped.
 //   - Converted series are merged into the stored series with the same
@@ -44,10 +44,15 @@ import (
 //
 // The samples of stored series returned unchanged are only read if needed.
 func (s *seriesSet) storedWins(stored, converted []*series) ([]*series, error) {
-	idx := newHistogramIndex(s.sel.suffix != "")
 	byLabels := make(map[uint64][]*series, len(converted))
 	for _, c := range converted {
-		idx.add(c.lset)
+		if len(c.floats) > 0 {
+			c.samples = make([]chunks.Sample, len(c.floats))
+			for i, smpl := range c.floats {
+				c.samples[i] = smpl
+			}
+			c.floats = c.floats[:0]
+		}
 		h := c.lset.Hash()
 		byLabels[h] = append(byLabels[h], c)
 	}
@@ -73,14 +78,10 @@ func (s *seriesSet) storedWins(stored, converted []*series) ([]*series, error) {
 	}
 
 	var (
-		ts  []int64
-		err error
+		groupTS, ts []int64
+		err         error
 	)
 	for _, st := range stored {
-		h := idx.get(st.lset)
-		if h == nil {
-			continue
-		}
 		if st.stored != nil {
 			if ts, err = s.appendTimestamps(ts[:0], st.stored); err != nil {
 				return nil, err
@@ -93,12 +94,12 @@ func (s *seriesSet) storedWins(stored, converted []*series) ([]*series, error) {
 				}
 			}
 		}
-		h.addTimestamps(ts)
+		groupTS = addTimestamps(groupTS, ts)
 	}
 
 	kept := converted[:0]
 	for _, c := range converted {
-		c.samples = shadow(c.samples, idx.get(c.lset).ts)
+		c.samples = shadow(c.samples, groupTS)
 		if slices.ContainsFunc(c.samples, func(smpl chunks.Sample) bool { return !isStale(smpl) }) {
 			kept = append(kept, c)
 		}
@@ -149,104 +150,89 @@ func (s *seriesSet) appendTimestamps(ts []int64, ser storage.Series) ([]int64, e
 	return ts, s.it.Err()
 }
 
-// histogramIndex indexes histograms by the labels that identify them: the
-// labels of their series without the metric name, as all series of a selector
-// have the same one, without the StoredAsLabel, and for classic histogram
-// series without le, too, as all series of a classic histogram belong to the
-// same histogram.
-type histogramIndex struct {
-	// ignored holds the sorted names of the labels that do not identify a
-	// histogram.
-	ignored []string
-	byHash  map[uint64][]*indexedHistogram
-	buf     []byte
-	b       *labels.Builder
-}
-
-// indexedHistogram is a histogram of a histogramIndex.
-type indexedHistogram struct {
+// histogramGroup holds the stored series and the series to convert from of one
+// histogram.
+type histogramGroup struct {
 	// id holds the labels that identify the histogram.
-	id labels.Labels
-	// ts holds the sorted timestamps of the samples of the histogram that
-	// are stored and read by the selector, without staleness markers.
-	ts []int64
+	id      labels.Labels
+	stored  []storage.Series
+	sources []storage.Series
 }
 
-// newHistogramIndex returns an index of the histograms of classic histogram
-// series if classic is true, of native histograms otherwise.
-func newHistogramIndex(classic bool) *histogramIndex {
-	idx := &histogramIndex{
-		ignored: []string{model.MetricNameLabel, StoredAsLabel},
-		byHash:  map[uint64][]*indexedHistogram{},
-		b:       labels.NewBuilder(labels.EmptyLabels()),
+// histogramIndex groups series by the labels that identify their histogram:
+// the labels of their series without the metric name, as all series of a
+// selector have the same base name, without the StoredAsLabel, and without le
+// where le does not identify the histogram.
+type histogramIndex struct {
+	groups []*histogramGroup
+	byHash map[uint64][]*histogramGroup
+	buf    []byte
+	b      *labels.Builder
+}
+
+var (
+	// Sorted label names to ignore when computing histogram identity.
+	ignoredNative  = []string{model.MetricNameLabel, StoredAsLabel}
+	ignoredClassic = []string{model.MetricNameLabel, StoredAsLabel, labels.BucketLabel}
+)
+
+func newHistogramIndex() *histogramIndex {
+	return &histogramIndex{
+		byHash: map[uint64][]*histogramGroup{},
+		b:      labels.NewBuilder(labels.EmptyLabels()),
 	}
-	if classic {
-		idx.ignored = append(idx.ignored, labels.BucketLabel)
+}
+
+// get returns the histogramGroup of the series with the given labels, creating
+// it if needed. If ignoreLe is true, the le label is not part of the histogram
+// identity.
+func (idx *histogramIndex) get(lset labels.Labels, ignoreLe bool) *histogramGroup {
+	ignored := ignoredNative
+	if ignoreLe {
+		ignored = ignoredClassic
 	}
-	return idx
-}
-
-// add indexes the histogram of the series with the given labels.
-func (idx *histogramIndex) add(lset labels.Labels) {
-	idx.lookup(lset, true)
-}
-
-// get returns the histogram of the series with the given labels, nil if it is
-// not indexed.
-func (idx *histogramIndex) get(lset labels.Labels) *indexedHistogram {
-	return idx.lookup(lset, false)
-}
-
-// lookup returns the histogram of the series with the given labels. If it is
-// not indexed, it indexes it if add is true, and returns nil otherwise.
-func (idx *histogramIndex) lookup(lset labels.Labels, add bool) *indexedHistogram {
 	var hash uint64
-	hash, idx.buf = lset.HashWithoutLabels(idx.buf, idx.ignored...)
-	candidates := idx.byHash[hash]
-	if len(candidates) == 0 && !add {
-		return nil
-	}
+	hash, idx.buf = lset.HashWithoutLabels(idx.buf, ignored...)
 	idx.b.Reset(lset)
-	id := idx.b.Del(idx.ignored...).Labels()
-	for _, h := range candidates {
-		if labels.Equal(h.id, id) {
-			return h
+	id := idx.b.Del(ignored...).Labels()
+	for _, g := range idx.byHash[hash] {
+		if labels.Equal(g.id, id) {
+			return g
 		}
 	}
-	if !add {
-		return nil
-	}
-	h := &indexedHistogram{id: id}
-	idx.byHash[hash] = append(idx.byHash[hash], h)
-	return h
+	g := &histogramGroup{id: id}
+	idx.byHash[hash] = append(idx.byHash[hash], g)
+	idx.groups = append(idx.groups, g)
+	return g
 }
 
-// addTimestamps adds the sorted timestamps ts to the ones of h.
-func (h *indexedHistogram) addTimestamps(ts []int64) {
+// addTimestamps returns the sorted union of dst and ts.
+func addTimestamps(dst, ts []int64) []int64 {
 	switch {
-	case len(ts) == 0 || slices.Equal(h.ts, ts):
+	case len(ts) == 0 || slices.Equal(dst, ts):
 		// The series of a classic histogram usually have the same timestamps.
-	case len(h.ts) == 0:
-		h.ts = slices.Clone(ts)
+		return dst
+	case len(dst) == 0:
+		return slices.Clone(ts)
 	default:
-		union := make([]int64, 0, len(h.ts)+len(ts))
+		union := make([]int64, 0, len(dst)+len(ts))
 		i, j := 0, 0
-		for i < len(h.ts) && j < len(ts) {
+		for i < len(dst) && j < len(ts) {
 			switch {
-			case h.ts[i] < ts[j]:
-				union = append(union, h.ts[i])
+			case dst[i] < ts[j]:
+				union = append(union, dst[i])
 				i++
-			case h.ts[i] > ts[j]:
+			case dst[i] > ts[j]:
 				union = append(union, ts[j])
 				j++
 			default:
-				union = append(union, h.ts[i])
+				union = append(union, dst[i])
 				i++
 				j++
 			}
 		}
-		union = append(union, h.ts[i:]...)
-		h.ts = append(union, ts[j:]...)
+		union = append(union, dst[i:]...)
+		return append(union, ts[j:]...)
 	}
 }
 

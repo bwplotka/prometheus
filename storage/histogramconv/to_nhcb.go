@@ -55,9 +55,9 @@ type classicHistogram struct {
 }
 
 // toNHCB converts the classic histogram series (_bucket, _count and _sum) of
-// sources to NHCB, one per label set without the le label. A classic histogram
-// that cannot be converted at a timestamp, e.g. because its buckets are not
-// cumulative, is skipped and reported in the returned annotations. In debug
+// sources to NHCB, one per label set without the le label. If collectWarnings
+// is true, a classic histogram that cannot be converted at a timestamp, e.g.
+// because its buckets are not cumulative, is reported in s.warnings. In debug
 // mode, the converted series have the StoredAsLabel, set to Classic.
 //
 // The NHCB is marked stale where all of its classic series are, e.g. because
@@ -65,15 +65,13 @@ type classicHistogram struct {
 // because the bucket layout changed. Converted samples other than staleness
 // markers have the latest start timestamp of the classic histogram samples
 // they were converted from.
-func toNHCB(sources []storage.Series, debug bool) ([]*series, annotations.Annotations, error) {
+func (s *seriesSet) toNHCB(sources []storage.Series, collectWarnings bool) ([]*series, error) {
 	var (
-		groups   []*nhcbGroup
-		byHash   = make(map[uint64][]int)
-		it       chunkenc.Iterator
-		warnings annotations.Annotations
+		groups []*nhcbGroup
+		byHash = make(map[uint64][]int)
 	)
-	for _, s := range sources {
-		lset := s.Labels()
+	for _, ser := range sources {
+		lset := ser.Labels()
 		suffixType, baseName := convertnhcb.GetHistogramMetricBaseName(lset.Get(model.MetricNameLabel))
 		if suffixType == convertnhcb.SuffixNone {
 			continue
@@ -84,7 +82,9 @@ func toNHCB(sources []storage.Series, debug bool) ([]*series, annotations.Annota
 			var err error
 			le, err = strconv.ParseFloat(bucket, 64)
 			if err != nil || math.IsNaN(le) {
-				warnings.Add(annotations.NewClassicToNHCBConversionWarning(baseName, fmt.Errorf("%w %q", errMalformedBucketLabel, bucket)))
+				if collectWarnings {
+					s.warnings.Add(annotations.NewClassicToNHCBConversionWarning(baseName, fmt.Errorf("%w %q", errMalformedBucketLabel, bucket)))
+				}
 				continue
 			}
 		}
@@ -92,13 +92,13 @@ func toNHCB(sources []storage.Series, debug bool) ([]*series, annotations.Annota
 		baseLabels := convertnhcb.GetHistogramMetricBase(lset, baseName)
 		group := lookupOrCreateGroup(&groups, byHash, baseLabels, baseName)
 
-		it = s.Iterator(it)
-		for valType := it.Next(); valType != chunkenc.ValNone; valType = it.Next() {
+		s.it = ser.Iterator(s.it)
+		for valType := s.it.Next(); valType != chunkenc.ValNone; valType = s.it.Next() {
 			if valType != chunkenc.ValFloat {
 				// Classic histogram series only hold float samples.
 				continue
 			}
-			t, v := it.At()
+			t, v := s.it.At()
 			if value.IsStaleNaN(v) {
 				// Stale markers are not part of the classic histogram at t.
 				group.stale[t] = struct{}{}
@@ -112,7 +112,7 @@ func toNHCB(sources []storage.Series, debug bool) ([]*series, annotations.Annota
 			// The series of a classic histogram usually have the same start
 			// timestamp. Where they do not, the NHCB gets the latest one, as
 			// all of them count from there.
-			temp.st = max(temp.st, it.AtST())
+			temp.st = max(temp.st, s.it.AtST())
 			switch suffixType {
 			case convertnhcb.SuffixBucket:
 				_ = temp.SetBucketCount(le, v)
@@ -122,8 +122,8 @@ func toNHCB(sources []storage.Series, debug bool) ([]*series, annotations.Annota
 				_ = temp.SetSum(v)
 			}
 		}
-		if err := it.Err(); err != nil {
-			return nil, warnings, err
+		if err := s.it.Err(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -157,7 +157,9 @@ func toNHCB(sources []storage.Series, debug bool) ([]*series, annotations.Annota
 				// A classic histogram that cannot be converted (e.g. a
 				// non-cumulative or incomplete exposition) is skipped, the rest
 				// of the series is still returned.
-				warnings.Add(annotations.NewClassicToNHCBConversionWarning(group.name, err))
+				if collectWarnings {
+					s.warnings.Add(annotations.NewClassicToNHCBConversionWarning(group.name, err))
+				}
 				continue
 			}
 			switch {
@@ -171,12 +173,12 @@ func toNHCB(sources []storage.Series, debug bool) ([]*series, annotations.Annota
 			continue
 		}
 		lset := group.labels
-		if debug {
+		if s.sel.debug {
 			lset = withStoredAs(lset, Classic)
 		}
 		converted = append(converted, &series{lset: lset, samples: samples})
 	}
-	return converted, warnings, nil
+	return converted, nil
 }
 
 // lookupOrCreateGroup returns the group for lset, creating it if needed. Groups

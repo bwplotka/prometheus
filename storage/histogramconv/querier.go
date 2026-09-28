@@ -23,7 +23,6 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/util/annotations"
 )
 
@@ -65,9 +64,8 @@ import (
 //     different timestamps, e.g. ingested from different sources, the merged
 //     series alternates between them, and a selector with le matchers that do
 //     not match any stored bucket returns the matching converted buckets.
-//   - Converted series, and stored series whose samples are filtered by
-//     representation, are buffered in memory before the first one is
-//     returned.
+//   - Converted samples, and stored samples filtered by representation, are
+//     buffered one histogram at a time.
 func NewQuerier(q storage.Querier, convertFrom []Representation) storage.Querier {
 	return &querier{Querier: q, convertFrom: newRepresentations(convertFrom...)}
 }
@@ -93,38 +91,73 @@ func (q *querier) Select(ctx context.Context, sortSeries bool, hints *storage.Se
 	case sel.passThrough():
 		return q.Querier.Select(ctx, sortSeries, hints, sel.matchers...)
 	}
-	s := &seriesSet{sel: sel, storedSet: q.Querier.Select(ctx, false, hints, sel.matchers...)}
+	s := &seriesSet{
+		sel:        sel,
+		sortSeries: sortSeries,
+		storedSet:  q.Querier.Select(ctx, false, hints, sel.matchers...),
+	}
 	if len(sel.sourceMatchers) > 0 {
 		s.sourceSet = q.Querier.Select(ctx, false, hints, sel.sourceMatchers...)
 	}
 	return s
 }
 
-// series is a series returned by a seriesSet: a converted series, a stored
-// series whose samples are filtered, or a stored series returned unchanged,
-// whose samples are only read if needed.
+// series is a series of a materialized histogramGroup: a converted series, a
+// stored series whose samples are filtered, or a stored series returned
+// unchanged, whose samples are only read if needed.
 type series struct {
 	lset    labels.Labels
-	samples []chunks.Sample
+	samples samples
+	floats  []fSample
+	inUse   int
 	// stored is the stored series returned unchanged, nil once its samples
 	// are read into samples.
 	stored storage.Series
 }
 
-// storageSeries returns s as a storage.Series.
-func (s *series) storageSeries() storage.Series {
+// iterator returns a chunkenc.Iterator over the samples of s.
+func (s *series) iterator(it chunkenc.Iterator) chunkenc.Iterator {
 	if s.stored != nil {
-		return s.stored
+		return s.stored.Iterator(it)
 	}
-	return storage.NewListSeries(s.lset, s.samples)
+	if len(s.floats) > 0 {
+		s.inUse++
+		if fsi, ok := it.(*floatSeriesIterator); ok {
+			return fsi.reset(s, s.floats)
+		}
+		return (&floatSeriesIterator{}).reset(s, s.floats)
+	}
+	return storage.NewListSeriesIterator(s.samples)
 }
 
-// seriesSet returns the stored and the converted series of a selector, sorted
-// by labels. It reads and converts them on the first call of Next, as the
-// samples of all the series to convert from are needed to convert any of
-// them.
+// lazySeries is a storage.Series whose histogramGroup is materialized on
+// demand when Iterator is called.
+type lazySeries struct {
+	s     *seriesSet
+	group *histogramGroup
+	idx   int
+	lset  labels.Labels
+}
+
+func (l lazySeries) Labels() labels.Labels { return l.lset }
+
+func (l lazySeries) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
+	if fsi, ok := it.(*floatSeriesIterator); ok {
+		fsi.release()
+	}
+	if l.s.cachedGroup != l.group {
+		if err := l.s.materialize(l.group, false); err != nil {
+			return errIterator{err: err}
+		}
+	}
+	return l.s.cachedSeries[l.idx].iterator(it)
+}
+
+// seriesSet returns the stored and the converted series of a selector, one
+// histogramGroup at a time, and sorted by labels if sortSeries is true.
 type seriesSet struct {
-	sel selector
+	sel        selector
+	sortSeries bool
 	// storedSet holds the stored series the selector reads, and also the
 	// series to convert from if sourceSet is nil.
 	storedSet, sourceSet storage.SeriesSet
@@ -134,124 +167,186 @@ type seriesSet struct {
 	h  *histogram.Histogram
 	fh *histogram.FloatHistogram
 
-	loaded   bool
-	series   []storage.Series
-	idx      int
+	classicBuilder *classicSeriesBuilder
+	boundaries     []float64
+
+	initialized bool
+	groups      []*histogramGroup
+	groupIdx    int
+
+	current []storage.Series
+	idx     int
+
+	cachedGroup  *histogramGroup
+	cachedSeries []*series
+
 	err      error
 	warnings annotations.Annotations
 }
 
 func (s *seriesSet) Next() bool {
-	if !s.loaded {
-		s.loaded = true
-		s.series, s.err = s.load()
+	if !s.initialized {
+		s.initialized = true
+		if s.err = s.init(); s.err != nil {
+			return false
+		}
 	}
-	if s.err != nil || s.idx >= len(s.series) {
-		return false
+	for s.idx >= len(s.current) {
+		if s.groupIdx >= len(s.groups) {
+			return false
+		}
+		g := s.groups[s.groupIdx]
+		s.groupIdx++
+		s.current = s.current[:0]
+		s.idx = 0
+		if s.err = s.appendGroupSeries(g); s.err != nil {
+			return false
+		}
 	}
 	s.idx++
 	return true
 }
 
 func (s *seriesSet) At() storage.Series {
-	if s.idx == 0 || s.idx > len(s.series) {
+	if s.idx == 0 || s.idx > len(s.current) {
 		return nil
 	}
-	return s.series[s.idx-1]
+	return s.current[s.idx-1]
 }
 
 func (s *seriesSet) Err() error { return s.err }
 
 func (s *seriesSet) Warnings() annotations.Annotations { return s.warnings }
 
-// load reads the stored series and the ones to convert from, converts them,
-// and lets the stored data win.
-func (s *seriesSet) load() ([]storage.Series, error) {
-	stored, sources, err := s.readSeries()
-	if err != nil {
-		return nil, err
-	}
-	var converted []*series
-	if len(sources) > 0 {
-		if converted, err = s.convert(sources); err != nil {
-			return nil, err
-		}
-	}
-	if len(converted) > 0 {
-		if converted, err = s.storedWins(stored, converted); err != nil {
-			return nil, err
-		}
-	}
-
-	out := make([]storage.Series, 0, len(stored)+len(converted))
-	for _, ser := range stored {
-		out = append(out, ser.storageSeries())
-	}
-	for _, ser := range converted {
-		out = append(out, ser.storageSeries())
-	}
-	slices.SortFunc(out, func(a, b storage.Series) int {
-		return labels.Compare(a.Labels(), b.Labels())
-	})
-	return out, nil
-}
-
-// readSeries returns the stored series the selector reads, and the series to
-// convert from. Unless the samples of the stored series are filtered by
-// representation, they are returned unchanged.
-func (s *seriesSet) readSeries() (stored []*series, sources []storage.Series, err error) {
-	var (
-		filter = s.sel.stored != allRepresentations || s.sel.debug
-		split  = storedSplitter{stored: s.sel.stored, debug: s.sel.debug}
-	)
+// init drains storedSet and sourceSet, groups their series by histogram, and
+// computes the shared exponential bucket boundaries if needed.
+func (s *seriesSet) init() error {
+	idx := newHistogramIndex()
+	ignoreLe := s.sel.suffix != ""
 	for s.storedSet.Next() {
 		ser := s.storedSet.At()
 		lset := ser.Labels()
 		if s.sel.from != 0 && lset.Get(model.MetricNameLabel) != s.sel.name {
-			sources = append(sources, ser)
+			g := idx.get(lset, true)
+			g.sources = append(g.sources, ser)
 			continue
 		}
 		if s.sel.suffix == "" && !matches(lset.Get(labels.BucketLabel), s.sel.leMatchers) {
 			continue
 		}
+		g := idx.get(lset, ignoreLe)
+		g.stored = append(g.stored, ser)
+	}
+	s.warnings.Merge(s.storedSet.Warnings())
+	if err := s.storedSet.Err(); err != nil {
+		return err
+	}
+	if s.sourceSet != nil {
+		for s.sourceSet.Next() {
+			ser := s.sourceSet.At()
+			g := idx.get(ser.Labels(), true)
+			g.sources = append(g.sources, ser)
+		}
+		s.warnings.Merge(s.sourceSet.Warnings())
+		if err := s.sourceSet.Err(); err != nil {
+			return err
+		}
+	}
+	s.groups = idx.groups
+
+	if s.sel.from.has(NHE) && s.sel.suffix == histogram.ClassicSuffixBucket {
+		var err error
+		if s.boundaries, err = s.exponentialBoundaries(); err != nil {
+			return err
+		}
+	}
+
+	if s.sortSeries {
+		for _, g := range s.groups {
+			if err := s.appendGroupSeries(g); err != nil {
+				return err
+			}
+		}
+		s.groupIdx = len(s.groups)
+		slices.SortFunc(s.current, func(a, b storage.Series) int {
+			return labels.Compare(a.Labels(), b.Labels())
+		})
+	}
+	return nil
+}
+
+// appendGroupSeries appends the storage.Series of g to s.current. If g only
+// has stored series that need no representation filtering, they are appended
+// without reading their samples.
+func (s *seriesSet) appendGroupSeries(g *histogramGroup) error {
+	filter := s.sel.stored != allRepresentations || s.sel.debug
+	if len(g.sources) == 0 && !filter {
+		start := len(s.current)
+		s.current = append(s.current, g.stored...)
+		slices.SortFunc(s.current[start:], func(a, b storage.Series) int {
+			return labels.Compare(a.Labels(), b.Labels())
+		})
+		return nil
+	}
+	if err := s.materialize(g, true); err != nil {
+		return err
+	}
+	for i, ser := range s.cachedSeries {
+		if ser.stored != nil {
+			s.current = append(s.current, ser.stored)
+		} else {
+			s.current = append(s.current, lazySeries{s: s, group: g, idx: i, lset: ser.lset})
+		}
+	}
+	return nil
+}
+
+// materialize converts and merges the series of g into s.cachedSeries.
+func (s *seriesSet) materialize(g *histogramGroup, collectWarnings bool) error {
+	var (
+		stored []*series
+		filter = s.sel.stored != allRepresentations || s.sel.debug
+		split  = storedSplitter{stored: s.sel.stored, debug: s.sel.debug}
+	)
+	for _, ser := range g.stored {
 		if !filter {
-			stored = append(stored, &series{lset: lset, stored: ser})
+			stored = append(stored, &series{lset: ser.Labels(), stored: ser})
 			continue
 		}
 		parts, err := split.split(ser)
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
 		stored = append(stored, parts...)
 	}
-	s.warnings.Merge(s.storedSet.Warnings())
-	if err := s.storedSet.Err(); err != nil {
-		return nil, nil, err
-	}
-	if s.sourceSet != nil {
-		for s.sourceSet.Next() {
-			sources = append(sources, s.sourceSet.At())
-		}
-		s.warnings.Merge(s.sourceSet.Warnings())
-		if err := s.sourceSet.Err(); err != nil {
-			return nil, nil, err
-		}
-	}
-	return stored, sources, nil
-}
 
-// convert converts the series to convert from.
-func (s *seriesSet) convert(sources []storage.Series) ([]*series, error) {
 	var (
 		converted []*series
-		warnings  annotations.Annotations
 		err       error
 	)
-	if s.sel.suffix != "" {
-		converted, warnings, err = toClassic(sources, s.sel.suffix, s.sel.from, s.sel.leMatchers, s.sel.debug)
-	} else {
-		converted, warnings, err = toNHCB(sources, s.sel.debug)
+	if len(g.sources) > 0 {
+		if s.sel.suffix != "" {
+			converted, err = s.toClassic(g.sources, collectWarnings)
+		} else {
+			converted, err = s.toNHCB(g.sources, collectWarnings)
+		}
+		if err != nil {
+			return err
+		}
 	}
-	s.warnings.Merge(warnings)
-	return converted, err
+	if len(stored) > 0 && len(converted) > 0 {
+		if converted, err = s.storedWins(stored, converted); err != nil {
+			return err
+		}
+	}
+
+	out := s.cachedSeries[:0]
+	out = append(out, stored...)
+	out = append(out, converted...)
+	slices.SortFunc(out, func(a, b *series) int {
+		return labels.Compare(a.lset, b.lset)
+	})
+	s.cachedGroup = g
+	s.cachedSeries = out
+	return nil
 }
