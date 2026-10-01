@@ -1,0 +1,41 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 5s
+  external_labels:
+    prometheus: demo
+
+# Prometheus scrapes itself once per job, storing its own
+# prometheus_http_request_duration_seconds histogram, which it exposes with both
+# classic and native (exponential) buckets, in a different representation per job.
+# The native parts are only exposed in the protobuf format, which is negotiated
+# by default when scrape_native_histograms is true.
+scrape_configs:
+  # Classic histogram only (default settings).
+  - job_name: 'classic'
+    static_configs:
+      - targets: ['localhost:1234']
+
+  # Native histogram with custom buckets (NHCB) only, converted from the classic
+  # histogram on scrape. The classic histogram is not stored.
+  - job_name: 'nhcb'
+    convert_classic_histograms_to_nhcb: true
+    static_configs:
+      - targets: ['localhost:1234']
+
+  # Native histogram with exponential buckets only, the classic buckets are
+  # dropped. Other histograms, exposed with classic buckets only (e.g.
+  # prometheus_http_response_size_bytes), are converted to NHCB, so that no
+  # classic histograms are stored for this job.
+  - job_name: 'native'
+    scrape_native_histograms: true
+    convert_classic_histograms_to_nhcb: true
+    static_configs:
+      - targets: ['localhost:1234']
+
+  # Both a classic and a native histogram with exponential buckets for the same
+  # series, e.g. while migrating from classic to native histograms.
+  - job_name: 'classic-and-native'
+    scrape_native_histograms: true
+    always_scrape_classic_histograms: true
+    static_configs:
+      - targets: ['localhost:1234']
