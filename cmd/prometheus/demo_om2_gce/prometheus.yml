@@ -1,0 +1,28 @@
+# [DEMO] Scrapes the same Go (client_golang) and Java (client_java) targets
+# twice, once with OpenMetrics 1.0 and once with OpenMetrics 2.0, so that the
+# stored series can be compared. Needs --enable-feature=openmetrics2. See
+# deploy.sh, which runs it on a GCE VM.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 5s
+
+scrape_configs:
+  # Go example, ./goapp, built with client_golang main.
+  - job_name: go-om1
+    scrape_protocols: [OpenMetricsText1.0.0]
+    static_configs:
+      - targets: [localhost:8081]
+  - job_name: go-om2
+    scrape_protocols: [OpenMetricsText2.0.0]
+    static_configs:
+      - targets: [localhost:8081]
+
+  # Java example, ./javaapp, built with client_java main.
+  - job_name: java-om1
+    scrape_protocols: [OpenMetricsText1.0.0]
+    static_configs:
+      - targets: [localhost:9400]
+  - job_name: java-om2
+    scrape_protocols: [OpenMetricsText2.0.0]
+    static_configs:
+      - targets: [localhost:9400]
