@@ -74,7 +74,7 @@ SECTIONS = [
             "title": "Go: series stored by only one scrape",
             "tab": "table",
             "panels": [("Only OM1", only_in("go", "om1", "om2")), ("Only OM2", only_in("go", "om2", "om1"))],
-            "text": "Both panels are empty when the two scrapes store exactly the same series. For client_golang, OM1 adds `_created` series, which OM2 carries inline as `st@` start timestamps instead. The UTF-8 gauge `http.server.active_requests` is stored as is with OM1, but as `http_server_active_requests` with OM2, as Prometheus does not ask for `escaping=allow-utf-8` when scraping OM2.",
+            "text": "Both panels are empty when the two scrapes store exactly the same series. The Go example does not enable `_created` series for OM1 (`EnableOpenMetricsTextCreatedSamples`), while OM2 always carries start timestamps inline as `st@`, which Prometheus does not store as series. The UTF-8 gauge `http.server.active_requests` is stored as is with OM1, but as `http_server_active_requests` with OM2, as Prometheus does not ask for `escaping=allow-utf-8` when scraping OM2.",
         },
         {
             "id": "java-diff",

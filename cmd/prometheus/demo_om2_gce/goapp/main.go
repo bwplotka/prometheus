@@ -101,8 +101,10 @@ func main() {
 	}()
 
 	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
-		EnableOpenMetrics:                   true,
-		EnableOpenMetricsTextCreatedSamples: true,
+		// NOTE: EnableOpenMetricsTextCreatedSamples stays off, so OM1 has no
+		// extra _created series. OM2 still carries start timestamps as st@, as
+		// the OM2 encoder writes them regardless of this option.
+		EnableOpenMetrics: true,
 		// OpenMetrics 2.0 is experimental, so it has to be listed explicitly.
 		AcceptedFormats: []expfmt.Format{
 			expfmt.FmtOpenMetrics_2_0_0,
