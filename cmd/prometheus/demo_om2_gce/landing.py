@@ -74,7 +74,7 @@ SECTIONS = [
             "title": "Go: series stored by only one scrape",
             "tab": "table",
             "panels": [("Only OM1", only_in("go", "om1", "om2")), ("Only OM2", only_in("go", "om2", "om1"))],
-            "text": "Both panels are empty when the two scrapes store exactly the same series. The Go example does not enable `_created` series for OM1 (`EnableOpenMetricsTextCreatedSamples`), while OM2 always carries start timestamps inline as `st@`, which Prometheus does not store as series. The UTF-8 gauge `http.server.active_requests` is stored as is with OM1, but as `http_server_active_requests` with OM2, as Prometheus does not ask for `escaping=allow-utf-8` when scraping OM2.",
+            "text": "Both panels are empty when the two scrapes store exactly the same series. The Go example does not enable `_created` series for OM1 (`EnableOpenMetricsTextCreatedSamples`), while OM2 always carries start timestamps inline as `st@`, which Prometheus does not store as series. The UTF-8 gauge `http.server.active_requests` is stored as is with OM1, but as `http_server_active_requests` with OM2, as Prometheus does not ask for `escaping=allow-utf-8` when scraping OM2. This is fixed in [prometheus/prometheus#19902](https://github.com/prometheus/prometheus/pull/19902).",
         },
         {
             "id": "java-diff",
@@ -401,8 +401,9 @@ esc = html.escape
 
 
 def md(text):
-    """Returns text as HTML, with `code` spans."""
-    return re.sub(r"`([^`]+)`", r"<code>\1</code>", esc(text, quote=False))
+    """Returns text as HTML, with `code` spans and [text](https://...) links."""
+    out = re.sub(r"`([^`]+)`", r"<code>\1</code>", esc(text, quote=False))
+    return re.sub(r"\[([^\]]+)\]\((https://[^)\s]+)\)", r'<a href="\2">\1</a>', out)
 
 
 prom_version, go_version, java_version, flags = sys.argv[2:6]
