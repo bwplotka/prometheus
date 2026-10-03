@@ -412,6 +412,18 @@ layout, so their `_bucket` series are synthesized:
   starts as NHCB and later switches to an exponential schema derives its `le` values from
   its own samples only.
 
-This feature only affects PromQL query evaluation. It does not apply to remote write
-(native histogram series are not converted when being forwarded to remote endpoints) and does not
+Individual selectors can control or debug conversion using the reserved `__opt_classic_from` matcher:
+
+* `__opt_classic_from="nhcb"` (or `!="nhe"`): converts only Native Histograms with Custom Buckets (NHCB) for the selector.
+* `__opt_classic_from="nhe"` (or `!="nhcb"`): converts only exponential native histograms (NHE) for the selector.
+* `__opt_classic_from=~"nhcb|nhe"`: converts both NHCB and NHE series (the default when no `__opt_classic_from` matcher is present).
+* `__opt_classic_from="none"` (or `=""`, `!~"nhcb|nhe"`): disables native-to-classic conversion for the selector and returns only stored classic series.
+* `__opt_classic_from="debug"` (or `=~"...|debug"`, e.g. `=~"nhcb|debug"`, `=~"nhe|debug"`, `=~"nhcb|nhe|debug"`): enables conversion (for both NHCB and NHE when `"debug"` is used alone, or for the matched schema(s)) and attaches `__stored_as__="nhcb"` to series converted from NHCB samples, `__stored_as__="nhe"` to series converted from exponential native histogram samples, and `__stored_as__="classic"` to all other returned series (e.g. stored classic series or series of selectors that are not converted). Stored and converted series are neither merged into the same labelset nor shadowed by each other, so all sources are returned in full side by side. In debug mode, `__stored_as__` matchers (e.g. `__stored_as__="nhcb"`) filter the returned series.
+
+Other values in `=` or `!=` matchers on `__opt_classic_from` return an error when this feature flag is enabled.
+
+Matchers with the `__opt_` prefix (such as `__opt_classic_from`) are always stripped before querying underlying storage (including remote read endpoints) and when this feature flag is disabled, so rolling back `--enable-feature=promql-nhcb-as-classic` does not break queries that use `__opt_classic_from`.
+
+This feature only affects PromQL query evaluation on local storage. It does not apply to remote write
+(native histogram series are not converted when being forwarded to remote endpoints) or remote read, and does not
 affect the series API (the `/api/v1/series` endpoint will not return the converted classic series).

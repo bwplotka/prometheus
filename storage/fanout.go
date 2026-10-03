@@ -95,7 +95,7 @@ func (f *fanout) Querier(mint, maxt int64) (Querier, error) {
 			secondaries = append(secondaries, querier)
 		}
 	}
-	return NewMergeQuerier([]Querier{primary}, secondaries, ChainedSeriesMerge), nil
+	return NewMergeQuerier([]Querier{NewOptStripQuerier(primary)}, secondaries, ChainedSeriesMerge), nil
 }
 
 func (f *fanout) ChunkQuerier(mint, maxt int64) (ChunkQuerier, error) {

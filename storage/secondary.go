@@ -53,7 +53,7 @@ func newSecondaryQuerierFromChunk(cq ChunkQuerier) genericQuerier {
 }
 
 func (s *secondaryQuerier) LabelValues(ctx context.Context, name string, hints *LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
-	vals, w, err := s.genericQuerier.LabelValues(ctx, name, hints, matchers...)
+	vals, w, err := labelValuesStripOpt(ctx, s.genericQuerier, name, hints, matchers)
 	if err != nil {
 		return nil, w.Add(err), nil
 	}
@@ -61,7 +61,7 @@ func (s *secondaryQuerier) LabelValues(ctx context.Context, name string, hints *
 }
 
 func (s *secondaryQuerier) LabelNames(ctx context.Context, hints *LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
-	names, w, err := s.genericQuerier.LabelNames(ctx, hints, matchers...)
+	names, w, err := labelNamesStripOpt(ctx, s.genericQuerier, hints, matchers)
 	if err != nil {
 		return nil, w.Add(err), nil
 	}
@@ -74,7 +74,11 @@ func (s *secondaryQuerier) SearchLabelNames(ctx context.Context, hints *SearchHi
 	if !ok {
 		return EmptySearchResultSet()
 	}
-	return warningsOnErrorSearchResultSet(searcher.SearchLabelNames(ctx, hints, matchers...))
+	stripped, err := StripOptMatchers(matchers)
+	if err != nil {
+		return warningsOnErrorSearchResultSet(ErrSearchResultSet(err))
+	}
+	return warningsOnErrorSearchResultSet(searcher.SearchLabelNames(ctx, hints, stripped...))
 }
 
 // SearchLabelValues returns search results from the wrapped querier and converts errors into warnings.
@@ -83,15 +87,23 @@ func (s *secondaryQuerier) SearchLabelValues(ctx context.Context, name string, h
 	if !ok {
 		return EmptySearchResultSet()
 	}
-	return warningsOnErrorSearchResultSet(searcher.SearchLabelValues(ctx, name, hints, matchers...))
+	stripped, err := StripOptMatchers(matchers)
+	if err != nil {
+		return warningsOnErrorSearchResultSet(ErrSearchResultSet(err))
+	}
+	return warningsOnErrorSearchResultSet(searcher.SearchLabelValues(ctx, name, hints, stripped...))
 }
 
 func (s *secondaryQuerier) Select(ctx context.Context, sortSeries bool, hints *SelectHints, matchers ...*labels.Matcher) genericSeriesSet {
 	if s.done {
 		panic("secondaryQuerier: Select invoked after first Next of any returned SeriesSet was done")
 	}
-
-	s.asyncSets = append(s.asyncSets, s.genericQuerier.Select(ctx, sortSeries, hints, matchers...))
+	stripped, err := StripOptMatchers(matchers)
+	if err != nil {
+		s.asyncSets = append(s.asyncSets, &genericSeriesSetAdapter{ErrSeriesSet(err)})
+	} else {
+		s.asyncSets = append(s.asyncSets, s.genericQuerier.Select(ctx, sortSeries, hints, stripped...))
+	}
 	curr := len(s.asyncSets) - 1
 	return &lazyGenericSeriesSet{init: func() (genericSeriesSet, bool) {
 		s.once.Do(func() {

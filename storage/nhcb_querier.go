@@ -15,6 +15,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"slices"
 	"sort"
@@ -30,18 +31,94 @@ import (
 	"github.com/prometheus/prometheus/util/annotations"
 )
 
+const (
+	// OptLabelPrefix is the reserved prefix for per-selector query option
+	// matchers (such as ClassicFromLabel). Matchers with this prefix are
+	// stripped before querying underlying storage (including remote read and
+	// when conversion feature flags are disabled) and omitted from absent()
+	// output, so rolling back a feature flag does not break queries that carry
+	// option matchers.
+	OptLabelPrefix = "__opt_"
+
+	// ClassicFromLabel is the control label that configures which native
+	// histogram schemas are converted to classic series per selector when
+	// NHCBAsClassicQuerier is active.
+	//
+	// Matchers on this label are stripped before querying the underlying
+	// storage:
+	//   - "nhcb" (or != "nhe"): converts only Native Histograms with Custom
+	//     Buckets (NHCB).
+	//   - "nhe" (or != "nhcb"): converts only exponential native histograms
+	//     (NHE).
+	//   - =~ "nhcb|nhe": converts both NHCB and NHE (default when no
+	//     ClassicFromLabel matcher is specified).
+	//   - "none" or "" (or !~ "nhcb|nhe"): disables native-to-classic
+	//     conversion for the selector and returns stored classic series
+	//     unchanged.
+	//   - "debug" (or =~ "...|debug", e.g. =~ "nhcb|debug", =~ "nhe|debug",
+	//     =~ "nhcb|nhe|debug"): enables conversion (for both NHCB and NHE when
+	//     "debug" is used alone, or for the matched schema(s)) and attaches
+	//     StoredAsLabel ("classic", "nhcb", or "nhe") to all returned series
+	//     without merging series of different storage forms into a single
+	//     labelset or shadowing native samples at stored classic timestamps.
+	//
+	// Any other value in an = or != matcher returns an error.
+	ClassicFromLabel = "__opt_classic_from"
+
+	// StoredAsLabel is the label added to returned series when a selector uses
+	// debug mode (__opt_classic_from="debug" or =~"...|debug"):
+	//   - "classic" for stored classic series (and any other unconverted series),
+	//   - "nhcb" for classic series converted from NHCB samples, and
+	//   - "nhe" for classic series converted from exponential native histogram
+	//     samples.
+	//
+	// Unlike ClassicFromLabel, it is a regular label on returned series. In
+	// debug mode, matchers on StoredAsLabel are applied to the returned series
+	// instead of the underlying storage, which never has this label. Otherwise,
+	// they are passed through to the underlying storage.
+	StoredAsLabel = "__stored_as__"
+
+	// StoredAsClassic is the StoredAsLabel value for stored classic series.
+	StoredAsClassic = "classic"
+	// StoredAsNHCB is the StoredAsLabel value for series converted from NHCB.
+	StoredAsNHCB = "nhcb"
+	// StoredAsNHE is the StoredAsLabel value for series converted from
+	// exponential native histograms.
+	StoredAsNHE = "nhe"
+)
+
+// errOnlyControlMatchers is returned when a selector's only non-empty matchers
+// are on __opt_* labels (or StoredAsLabel in debug mode), because stripping
+// them would leave an empty selector that selects all series from the
+// underlying storage.
+var errOnlyControlMatchers = fmt.Errorf("vector selector must contain at least one non-empty matcher besides %s and %s", ClassicFromLabel, StoredAsLabel)
+
+// errInvalidControlValue is returned when an equality or inequality matcher on
+// ClassicFromLabel uses an unknown value, because silently returning no data
+// for e.g. a typo would be hard to debug.
+var errInvalidControlValue = fmt.Errorf(`invalid %s value, must be one of "nhcb", "nhe", "none" or "debug"`, ClassicFromLabel)
+
 // Known limitations of the native-to-classic conversion:
 //
-//  1. TODO: This does not support the series API (LabelNames, LabelValues, etc.).
-//     Only the Select method is wrapped. Any metadata or label introspection
-//     queries will not reflect the converted classic series.
-//  2. Exponential native histograms have no fixed bucket layout, so their
+//  1. TODO: This does not support the series API (Select with Func: "series",
+//     LabelNames, LabelValues, SearchLabelNames, SearchLabelValues). Those
+//     methods only strip __opt_* matchers, so any metadata or label
+//     introspection queries will not reflect the converted classic series.
+//  2. TODO: Only local storage is wrapped (see cmd/prometheus/main.go); remote
+//     read secondaries in the fanout storage have __opt_* matchers stripped and
+//     are not converted.
+//  3. Exponential native histograms have no fixed bucket layout, so their
 //     classic buckets are synthesized: either at the le values pinned by the
 //     query or at the populated bucket bounds (capped at
 //     exponentialAsClassicMaxSchema) unified across the series of a Select.
 //     Bounds that do not coincide with an exponential bucket boundary are
 //     interpolated, so le="0.1" style queries are estimates rather than exact
 //     counts.
+
+var (
+	_ Searcher = (*NHCBAsClassicQuerier)(nil)
+	_ Searcher = (*optStripQuerier)(nil)
+)
 
 // NHCBAsClassicQuerier wraps a Querier and converts native histogram (NHCB and
 // exponential) queries to classic histogram format when classic series don't
@@ -87,15 +164,57 @@ const exponentialAsClassicMaxSchema int32 = 2
 
 // Select implements the Querier interface.
 func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hints *SelectHints, matchers ...*labels.Matcher) SeriesSet {
-	nameMatcher, suffix, baseMatchers, leMatchers := extractHistogramSuffix(matchers)
-	if suffix == "" {
-		// Not a classic histogram query, pass through.
-		return q.Querier.Select(ctx, sortSeries, hints, matchers...)
+	if hints != nil && hints.Func == "series" {
+		// NOTE: /api/v1/series never converts native histograms (nor attaches
+		// StoredAsLabel), so strip __opt_* matchers and pass through directly.
+		stripped, err := StripOptMatchers(matchers)
+		if err != nil {
+			return ErrSeriesSet(err)
+		}
+		return q.Querier.Select(ctx, sortSeries, hints, stripped...)
+	}
+	strippedMatchers, convertNHCB, convertNHE, debug, matched, err := extractControlMatchers(matchers)
+	if err != nil {
+		return ErrSeriesSet(err)
+	}
+	if !matched {
+		// Contradictory control matchers (e.g. ="nhcb" and ="nhe") select nothing.
+		return NoopSeriesSet()
+	}
+	if debug && slices.ContainsFunc(strippedMatchers, isStoredAsMatcher) {
+		// NOTE: StoredAsLabel only exists on returned series in debug mode, so
+		// its matchers are applied to the output instead of being pushed down.
+		var storedAsMatchers, rest []*labels.Matcher
+		for _, m := range strippedMatchers {
+			if isStoredAsMatcher(m) {
+				storedAsMatchers = append(storedAsMatchers, m)
+			} else {
+				rest = append(rest, m)
+			}
+		}
+		if !slices.ContainsFunc(rest, func(m *labels.Matcher) bool { return !m.Matches("") }) {
+			return ErrSeriesSet(errOnlyControlMatchers)
+		}
+		return &storedAsFilterSeriesSet{
+			SeriesSet: q.selectConverted(ctx, sortSeries, hints, convertNHCB, convertNHE, debug, rest),
+			matchers:  storedAsMatchers,
+		}
+	}
+	return q.selectConverted(ctx, sortSeries, hints, convertNHCB, convertNHE, debug, strippedMatchers)
+}
+
+// selectConverted selects series for strippedMatchers (without control
+// matchers), converting enabled native histogram schemas to classic series.
+func (q *NHCBAsClassicQuerier) selectConverted(ctx context.Context, sortSeries bool, hints *SelectHints, convertNHCB, convertNHE, debug bool, strippedMatchers []*labels.Matcher) SeriesSet {
+	nameMatcher, suffix, baseMatchers, leMatchers := extractHistogramSuffix(strippedMatchers)
+	if suffix == "" || (!convertNHCB && !convertNHE) {
+		// Not a classic histogram query, or conversion explicitly disabled.
+		return q.selectUnconverted(ctx, sortSeries, hints, debug, strippedMatchers)
 	}
 
 	baseNameMatcher := newBaseNameMatcher(nameMatcher.Type, nameMatcher.Value, suffix)
 	if baseNameMatcher == nil {
-		return q.Querier.Select(ctx, sortSeries, hints, matchers...)
+		return q.selectUnconverted(ctx, sortSeries, hints, debug, strippedMatchers)
 	}
 
 	// Reuse baseMatchers' spare capacity to append baseNameMatcher without allocating.
@@ -111,11 +230,11 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 		chkIter       chunkenc.Iterator
 		hScratch      histogram.Histogram
 		fhScratch     histogram.FloatHistogram
-		exponentialOK = suffix == histogram.ClassicSuffixBucket
+		exponentialOK = convertNHE && suffix == histogram.ClassicSuffixBucket
 	)
 	for nhcbSet.Next() {
 		s := nhcbSet.At()
-		firstKind, chkIter = classifyNativeSeries(s, chkIter, &hScratch, &fhScratch)
+		firstKind, chkIter = classifyNativeSeries(s, chkIter, &hScratch, &fhScratch, convertNHCB, convertNHE)
 		if firstKind == nativeSeriesNone {
 			continue
 		}
@@ -130,7 +249,7 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 	// the classic query with all original matchers (preserving le pushdown and
 	// streaming directly from the underlying Querier).
 	if firstNHCB == nil {
-		classicSet := q.Querier.Select(ctx, sortSeries, hints, matchers...)
+		classicSet := q.selectUnconverted(ctx, sortSeries, hints, debug, strippedMatchers)
 		if w := nhcbSet.Warnings(); len(w) > 0 {
 			return &warningsSeriesSet{SeriesSet: classicSet, warnings: w}
 		}
@@ -141,7 +260,7 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 	// a stored classic histogram exists at a given timestamp even when the
 	// query's le matcher only selects a subset of buckets (or a bucket label
 	// that differs between stored classic and converted NHCB).
-	classicMatchers := matchers
+	classicMatchers := strippedMatchers
 	if len(leMatchers) > 0 {
 		classicMatchers = make([]*labels.Matcher, 0, len(baseMatchers)+1)
 		classicMatchers = append(classicMatchers, baseMatchers...)
@@ -180,11 +299,12 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 
 	// Fast path 2: when no stored classic series exist and either sortSeries is
 	// false or suffix is _count/_sum (which has no le label and therefore
-	// preserves nhcbSet's sort order), stream NHCB series directly from nhcbSet
-	// one series at a time without buffering all series up front. The series
-	// set switches to exponential mode itself once it meets the first
-	// exponential series, buffering only the remaining ones.
-	if firstClassic == nil && (!sortSeries || suffix != histogram.ClassicSuffixBucket) {
+	// preserves nhcbSet's sort order unless debug mode can emit both "nhcb" and
+	// "nhe" StoredAsLabel values), stream NHCB series directly from nhcbSet one
+	// series at a time without buffering all series up front. The series set
+	// switches to exponential mode itself once it meets the first exponential
+	// series, buffering only the remaining ones.
+	if firstClassic == nil && (!sortSeries || (suffix != histogram.ClassicSuffixBucket && (!debug || !convertNHCB || !convertNHE))) {
 		return &nhcbToClassicSeriesSet{
 			ctx:             ctx,
 			firstNHCB:       firstNHCB,
@@ -194,6 +314,9 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 			suffix:          suffix,
 			bounds:          bounds,
 			exponentialMode: exponentialOK,
+			convertNHCB:     convertNHCB,
+			convertNHE:      convertNHE,
+			debug:           debug,
 			warnings:        warnings,
 		}
 	}
@@ -212,7 +335,7 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 		for nhcbSet.Next() {
 			s := nhcbSet.At()
 			var kind nativeSeriesKind
-			if kind, chkIter = classifyNativeSeries(s, chkIter, &hScratch, &fhScratch); kind == nativeSeriesNone {
+			if kind, chkIter = classifyNativeSeries(s, chkIter, &hScratch, &fhScratch, convertNHCB, convertNHE); kind == nativeSeriesNone {
 				continue
 			}
 			anyExponential = anyExponential || kind == nativeSeriesExponential
@@ -236,7 +359,7 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 		for nhcbSet.Next() {
 			s := nhcbSet.At()
 			var kind nativeSeriesKind
-			if kind, chkIter = classifyNativeSeries(s, chkIter, &hScratch, &fhScratch); kind == nativeSeriesNone {
+			if kind, chkIter = classifyNativeSeries(s, chkIter, &hScratch, &fhScratch, convertNHCB, convertNHE); kind == nativeSeriesNone {
 				continue
 			}
 			anyExponential = anyExponential || kind == nativeSeriesExponential
@@ -256,14 +379,334 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 	}
 
 	return &nhcbToClassicSeriesSet{
-		ctx:        ctx,
-		groups:     groups,
-		leMatchers: leMatchers,
-		suffix:     suffix,
-		bounds:     bounds,
-		sortSeries: sortSeries,
-		warnings:   warnings,
+		ctx:         ctx,
+		groups:      groups,
+		leMatchers:  leMatchers,
+		suffix:      suffix,
+		bounds:      bounds,
+		sortSeries:  sortSeries,
+		convertNHCB: convertNHCB,
+		convertNHE:  convertNHE,
+		debug:       debug,
+		warnings:    warnings,
 	}
+}
+
+// LabelValues implements the Querier interface. __opt_* matchers are
+// stripped, so the same selector can be reused for label APIs (e.g. in Grafana
+// variables), which never convert.
+func (q *NHCBAsClassicQuerier) LabelValues(ctx context.Context, name string, hints *LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return labelValuesStripOpt(ctx, q.Querier, name, hints, matchers)
+}
+
+// LabelNames implements the Querier interface. __opt_* matchers are
+// stripped, for the same reason as in LabelValues.
+func (q *NHCBAsClassicQuerier) LabelNames(ctx context.Context, hints *LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return labelNamesStripOpt(ctx, q.Querier, hints, matchers)
+}
+
+// SearchLabelNames implements the Searcher interface by stripping __opt_*
+// matchers before delegating to the underlying Querier.
+func (q *NHCBAsClassicQuerier) SearchLabelNames(ctx context.Context, hints *SearchHints, matchers ...*labels.Matcher) SearchResultSet {
+	return searchLabelNamesStripOpt(ctx, q.Querier, hints, matchers)
+}
+
+// SearchLabelValues implements the Searcher interface by stripping __opt_*
+// matchers before delegating to the underlying Querier.
+func (q *NHCBAsClassicQuerier) SearchLabelValues(ctx context.Context, name string, hints *SearchHints, matchers ...*labels.Matcher) SearchResultSet {
+	return searchLabelValuesStripOpt(ctx, q.Querier, name, hints, matchers)
+}
+
+// IsOptMatcher reports whether m is a per-selector query option matcher
+// (having OptLabelPrefix).
+func IsOptMatcher(m *labels.Matcher) bool {
+	return strings.HasPrefix(m.Name, OptLabelPrefix)
+}
+
+// StripOptMatchers returns matchers without any OptLabelPrefix matchers.
+// When none is present, matchers is returned as-is without allocating.
+// If stripping leaves no non-empty matchers, errOnlyControlMatchers is returned.
+func StripOptMatchers(matchers []*labels.Matcher) ([]*labels.Matcher, error) {
+	if !slices.ContainsFunc(matchers, IsOptMatcher) {
+		return matchers, nil
+	}
+	stripped := make([]*labels.Matcher, 0, len(matchers)-1)
+	for _, m := range matchers {
+		if !IsOptMatcher(m) {
+			stripped = append(stripped, m)
+		}
+	}
+	if !slices.ContainsFunc(stripped, func(m *labels.Matcher) bool { return !m.Matches("") }) {
+		return nil, errOnlyControlMatchers
+	}
+	return stripped, nil
+}
+
+// optStripQuerier wraps a Querier and strips any OptLabelPrefix matchers before
+// forwarding calls. It is used when conversion feature flags are disabled and
+// on remote read secondaries so that __opt_* matchers never reach storage.
+type optStripQuerier struct {
+	Querier
+}
+
+// NewOptStripQuerier returns a Querier that strips OptLabelPrefix matchers
+// before delegating to q. If q already strips option matchers (such as
+// NHCBAsClassicQuerier or optStripQuerier), q is returned as-is.
+func NewOptStripQuerier(q Querier) Querier {
+	switch q.(type) {
+	case nil, noopQuerier, *NHCBAsClassicQuerier, *optStripQuerier:
+		return q
+	default:
+		return &optStripQuerier{Querier: q}
+	}
+}
+
+func (q *optStripQuerier) Select(ctx context.Context, sortSeries bool, hints *SelectHints, matchers ...*labels.Matcher) SeriesSet {
+	stripped, err := StripOptMatchers(matchers)
+	if err != nil {
+		return ErrSeriesSet(err)
+	}
+	return q.Querier.Select(ctx, sortSeries, hints, stripped...)
+}
+
+func (q *optStripQuerier) LabelValues(ctx context.Context, name string, hints *LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return labelValuesStripOpt(ctx, q.Querier, name, hints, matchers)
+}
+
+func (q *optStripQuerier) LabelNames(ctx context.Context, hints *LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return labelNamesStripOpt(ctx, q.Querier, hints, matchers)
+}
+
+func (q *optStripQuerier) SearchLabelNames(ctx context.Context, hints *SearchHints, matchers ...*labels.Matcher) SearchResultSet {
+	return searchLabelNamesStripOpt(ctx, q.Querier, hints, matchers)
+}
+
+func (q *optStripQuerier) SearchLabelValues(ctx context.Context, name string, hints *SearchHints, matchers ...*labels.Matcher) SearchResultSet {
+	return searchLabelValuesStripOpt(ctx, q.Querier, name, hints, matchers)
+}
+
+func labelValuesStripOpt(ctx context.Context, q LabelQuerier, name string, hints *LabelHints, matchers []*labels.Matcher) ([]string, annotations.Annotations, error) {
+	stripped, err := StripOptMatchers(matchers)
+	if err != nil {
+		return nil, nil, err
+	}
+	return q.LabelValues(ctx, name, hints, stripped...)
+}
+
+func labelNamesStripOpt(ctx context.Context, q LabelQuerier, hints *LabelHints, matchers []*labels.Matcher) ([]string, annotations.Annotations, error) {
+	stripped, err := StripOptMatchers(matchers)
+	if err != nil {
+		return nil, nil, err
+	}
+	return q.LabelNames(ctx, hints, stripped...)
+}
+
+func searchLabelNamesStripOpt(ctx context.Context, q Querier, hints *SearchHints, matchers []*labels.Matcher) SearchResultSet {
+	s, ok := q.(Searcher)
+	if !ok {
+		return EmptySearchResultSet()
+	}
+	stripped, err := StripOptMatchers(matchers)
+	if err != nil {
+		return ErrSearchResultSet(err)
+	}
+	return s.SearchLabelNames(ctx, hints, stripped...)
+}
+
+func searchLabelValuesStripOpt(ctx context.Context, q Querier, name string, hints *SearchHints, matchers []*labels.Matcher) SearchResultSet {
+	s, ok := q.(Searcher)
+	if !ok {
+		return EmptySearchResultSet()
+	}
+	stripped, err := StripOptMatchers(matchers)
+	if err != nil {
+		return ErrSearchResultSet(err)
+	}
+	return s.SearchLabelValues(ctx, name, hints, stripped...)
+}
+
+// selectUnconverted selects series from the underlying Querier without
+// native-to-classic conversion. In debug mode, all returned series get
+// StoredAsLabel="classic", because none of them were converted from native
+// histograms.
+//
+// NOTE: Adding a constant StoredAsLabel preserves sortSeries order because
+// every stored series has __name__ and no user labels sort between __name__ and
+// __stored_as__.
+func (q *NHCBAsClassicQuerier) selectUnconverted(ctx context.Context, sortSeries bool, hints *SelectHints, debug bool, matchers []*labels.Matcher) SeriesSet {
+	ss := q.Querier.Select(ctx, sortSeries, hints, matchers...)
+	if debug {
+		ss = newStoredAsSeriesSet(ss, StoredAsClassic)
+	}
+	return ss
+}
+
+func isClassicFromMatcher(m *labels.Matcher) bool {
+	return m.Name == ClassicFromLabel
+}
+
+func isStoredAsMatcher(m *labels.Matcher) bool {
+	return m.Name == StoredAsLabel
+}
+
+func matchesAllControl(val string, ms []*labels.Matcher) bool {
+	for _, m := range ms {
+		if !m.Matches(val) {
+			return false
+		}
+	}
+	return true
+}
+
+// hasPositiveDebugMatcher reports whether at least one matcher positively
+// selects "debug" without also matching the empty value or "none".
+//
+// NOTE: A negative matcher such as __opt_classic_from!="nhe" or a broad
+// wildcard such as __opt_classic_from=~".+" matches the string "debug" under
+// standard matcher semantics, but is intended to select conversion schemas
+// rather than enable debug label injection.
+func hasPositiveDebugMatcher(ms []*labels.Matcher) bool {
+	for _, m := range ms {
+		if (m.Type == labels.MatchEqual || m.Type == labels.MatchRegexp) &&
+			m.Matches("debug") && !m.Matches("") && !m.Matches("none") {
+			return true
+		}
+	}
+	return false
+}
+
+// extractControlMatchers strips any OptLabelPrefix matchers from matchers
+// and evaluates which native histogram schemas ("nhcb", "nhe") and debug mode
+// are enabled for the selector. Conversion of both schemas is enabled by
+// default. When no OptLabelPrefix matcher is present, matchers is returned
+// as-is without allocating.
+func extractControlMatchers(matchers []*labels.Matcher) (stripped []*labels.Matcher, convertNHCB, convertNHE, debug, matched bool, err error) {
+	if !slices.ContainsFunc(matchers, IsOptMatcher) {
+		return matchers, true, true, false, true, nil
+	}
+
+	var controlMatchers []*labels.Matcher
+	stripped = make([]*labels.Matcher, 0, len(matchers)-1)
+	for _, m := range matchers {
+		switch {
+		case isClassicFromMatcher(m):
+			if err := validateControlMatcher(m); err != nil {
+				return nil, false, false, false, false, err
+			}
+			controlMatchers = append(controlMatchers, m)
+		case IsOptMatcher(m):
+			// Strip other __opt_* matchers without affecting conversion.
+		default:
+			stripped = append(stripped, m)
+		}
+	}
+	if !slices.ContainsFunc(stripped, func(m *labels.Matcher) bool { return !m.Matches("") }) {
+		return nil, false, false, false, false, errOnlyControlMatchers
+	}
+	if len(controlMatchers) == 0 {
+		return stripped, true, true, false, true, nil
+	}
+
+	matchNHCB := matchesAllControl(StoredAsNHCB, controlMatchers)
+	matchNHE := matchesAllControl(StoredAsNHE, controlMatchers)
+	matchNone := matchesAllControl("none", controlMatchers) || matchesAllControl("", controlMatchers)
+	matchDebug := matchesAllControl("debug", controlMatchers) && hasPositiveDebugMatcher(controlMatchers)
+
+	switch {
+	case matchNHCB || matchNHE:
+		return stripped, matchNHCB, matchNHE, matchDebug, true, nil
+	case matchDebug:
+		return stripped, true, true, true, true, nil
+	case matchNone:
+		return stripped, false, false, false, true, nil
+	default:
+		return stripped, false, false, false, false, nil
+	}
+}
+
+// validateControlMatcher returns an error for equality and inequality matchers
+// with unknown values. Regexp matchers are not validated, as they can
+// legitimately match unknown values (e.g. =~".+").
+func validateControlMatcher(m *labels.Matcher) error {
+	if m.Type != labels.MatchEqual && m.Type != labels.MatchNotEqual {
+		return nil
+	}
+	switch m.Value {
+	case "", "none", StoredAsNHCB, StoredAsNHE, "debug":
+		return nil
+	default:
+		return fmt.Errorf("%w, got %q", errInvalidControlValue, m.Value)
+	}
+}
+
+func withStoredAs(lset labels.Labels, val string, b *labels.Builder) labels.Labels {
+	if b == nil {
+		b = labels.NewBuilder(lset)
+	} else {
+		b.Reset(lset)
+	}
+	b.Set(StoredAsLabel, val)
+	return b.Labels()
+}
+
+type relabeledSeries struct {
+	Series
+	lset labels.Labels
+}
+
+func (s relabeledSeries) Labels() labels.Labels { return s.lset }
+
+type storedAsSeriesSet struct {
+	SeriesSet
+	val     string
+	builder *labels.Builder
+	cur     Series
+}
+
+func newStoredAsSeriesSet(ss SeriesSet, val string) SeriesSet {
+	return &storedAsSeriesSet{
+		SeriesSet: ss,
+		val:       val,
+		builder:   labels.NewBuilder(labels.EmptyLabels()),
+	}
+}
+
+func (s *storedAsSeriesSet) Next() bool {
+	if !s.SeriesSet.Next() {
+		s.cur = nil
+		return false
+	}
+	ser := s.SeriesSet.At()
+	if ser == nil {
+		s.cur = nil
+		return true
+	}
+	s.cur = relabeledSeries{
+		Series: ser,
+		lset:   withStoredAs(ser.Labels(), s.val, s.builder),
+	}
+	return true
+}
+
+func (s *storedAsSeriesSet) At() Series { return s.cur }
+
+// storedAsFilterSeriesSet filters series by StoredAsLabel matchers.
+type storedAsFilterSeriesSet struct {
+	SeriesSet
+	matchers []*labels.Matcher
+}
+
+func (s *storedAsFilterSeriesSet) Next() bool {
+	for s.SeriesSet.Next() {
+		ser := s.At()
+		if ser == nil {
+			continue
+		}
+		if matchesAllControl(ser.Labels().Get(StoredAsLabel), s.matchers) {
+			return true
+		}
+	}
+	return false
 }
 
 // unifiedExponentialBounds returns the classic bounds to evaluate on all
@@ -293,20 +736,22 @@ type nativeSeriesKind uint8
 
 const (
 	// nativeSeriesNone is a series that is not converted: it carries an le
-	// label, has no samples, or its first non-stale sample is not a histogram.
+	// label, has no samples, or has no non-stale sample with an enabled native
+	// histogram schema.
 	nativeSeriesNone nativeSeriesKind = iota
-	// nativeSeriesNHCB is a series whose first non-stale sample is a custom
-	// buckets histogram.
+	// nativeSeriesNHCB is a series whose first enabled non-stale sample is a
+	// custom buckets histogram.
 	nativeSeriesNHCB
-	// nativeSeriesExponential is a series whose first non-stale sample is an
-	// exponential schema histogram.
+	// nativeSeriesExponential is a series whose first enabled non-stale sample
+	// is an exponential schema histogram.
 	nativeSeriesExponential
 )
 
-// classifyNativeSeries classifies s by its first non-stale sample. Stale
-// markers (histograms with a StaleNaN sum, or float StaleNaN samples) are
-// skipped, as they carry no schema information.
-func classifyNativeSeries(s Series, it chunkenc.Iterator, h *histogram.Histogram, fh *histogram.FloatHistogram) (nativeSeriesKind, chunkenc.Iterator) {
+// classifyNativeSeries classifies s by its first non-stale sample that matches
+// an enabled conversion schema (convertNHCB or convertNHE). Stale markers
+// (histograms with a StaleNaN sum, or float StaleNaN samples) and disabled
+// schemas are skipped.
+func classifyNativeSeries(s Series, it chunkenc.Iterator, h *histogram.Histogram, fh *histogram.FloatHistogram, convertNHCB, convertNHE bool) (nativeSeriesKind, chunkenc.Iterator) {
 	if s == nil || s.Labels().Has(labels.BucketLabel) {
 		return nativeSeriesNone, it
 	}
@@ -343,9 +788,13 @@ func classifyNativeSeries(s Series, it chunkenc.Iterator, h *histogram.Histogram
 		}
 		switch {
 		case histogram.IsCustomBucketsSchema(schema):
-			return nativeSeriesNHCB, it
+			if convertNHCB {
+				return nativeSeriesNHCB, it
+			}
 		case histogram.IsExponentialSchema(schema):
-			return nativeSeriesExponential, it
+			if convertNHE {
+				return nativeSeriesExponential, it
+			}
 		default:
 			return nativeSeriesNone, it
 		}
@@ -709,6 +1158,9 @@ type nhcbToClassicSeriesSet struct {
 	// where the streaming path has to unify bounds across the exponential
 	// series it meets.
 	exponentialMode bool
+	convertNHCB     bool
+	convertNHE      bool
+	debug           bool
 
 	initialized bool
 	series      []Series
@@ -786,7 +1238,7 @@ func (s *nhcbToClassicSeriesSet) Next() bool {
 			} else {
 				for s.nhcbSet.Next() {
 					cand := s.nhcbSet.At()
-					if kind, s.it = classifyNativeSeries(cand, s.it, s.h, s.fh); kind != nativeSeriesNone {
+					if kind, s.it = classifyNativeSeries(cand, s.it, s.h, s.fh, s.convertNHCB, s.convertNHE); kind != nativeSeriesNone {
 						nhcbSeries = cand
 						break
 					}
@@ -858,7 +1310,7 @@ func (s *nhcbToClassicSeriesSet) collectRemaining(first Series) error {
 	for s.nhcbSet.Next() {
 		cand := s.nhcbSet.At()
 		var kind nativeSeriesKind
-		if kind, s.it = classifyNativeSeries(cand, s.it, s.h, s.fh); kind != nativeSeriesNone {
+		if kind, s.it = classifyNativeSeries(cand, s.it, s.h, s.fh, s.convertNHCB, s.convertNHE); kind != nativeSeriesNone {
 			s.groups = append(s.groups, histogramGroup{nhcb: []Series{cand}})
 		}
 	}
@@ -911,6 +1363,12 @@ func (s *nhcbToClassicSeriesSet) convertGroup(g *histogramGroup, dst []Series) (
 		out := dst[:0]
 		for _, cs := range g.classic {
 			if matchesLe(cs.Labels(), s.leMatchers, false) {
+				if s.debug {
+					cs = relabeledSeries{
+						Series: cs,
+						lset:   withStoredAs(cs.Labels(), StoredAsClassic, s.lsetBuilder),
+					}
+				}
 				out = append(out, cs)
 			}
 		}
@@ -923,13 +1381,24 @@ func (s *nhcbToClassicSeriesSet) convertGroup(g *histogramGroup, dst []Series) (
 		filteredClassic []Series
 	)
 	if len(g.classic) > 0 {
-		var err error
-		groupTS, s.it, err = collectClassicTimestamps(g.classic, s.it)
-		if err != nil {
-			return nil, err
+		// NOTE: In debug mode, stored classic and converted series get distinct
+		// StoredAsLabel values, so we skip shadowing native samples at stored
+		// classic timestamps to show all sources side by side.
+		if !s.debug {
+			var err error
+			groupTS, s.it, err = collectClassicTimestamps(g.classic, s.it)
+			if err != nil {
+				return nil, err
+			}
 		}
 		for _, cs := range g.classic {
 			if matchesLe(cs.Labels(), s.leMatchers, false) {
+				if s.debug {
+					cs = relabeledSeries{
+						Series: cs,
+						lset:   withStoredAs(cs.Labels(), StoredAsClassic, s.lsetBuilder),
+					}
+				}
 				filteredClassic = append(filteredClassic, cs)
 			}
 		}
@@ -969,7 +1438,17 @@ func (s *nhcbToClassicSeriesSet) convertGroup(g *histogramGroup, dst []Series) (
 // convertNHCBSeries converts a single NHCB series into classic series,
 // shadowing samples at timestamps where the stored classic histogram is active.
 func (s *nhcbToClassicSeriesSet) convertNHCBSeries(nhcbSeries Series, groupTS []int64, dst []Series) ([]Series, error) {
-	nhcbLabels := nhcbSeries.Labels()
+	baseLabels := nhcbSeries.Labels()
+	nhcbLabels := baseLabels
+	expLabels := baseLabels
+	if s.debug {
+		if s.convertNHCB {
+			nhcbLabels = withStoredAs(baseLabels, StoredAsNHCB, s.lsetBuilder)
+		}
+		if s.convertNHE {
+			expLabels = withStoredAs(baseLabels, StoredAsNHE, s.lsetBuilder)
+		}
+	}
 	s.it = nhcbSeries.Iterator(s.it)
 	if s.it == nil {
 		return nil, nil
@@ -1001,9 +1480,9 @@ func (s *nhcbToClassicSeriesSet) convertNHCBSeries(nhcbSeries Series, groupTS []
 			switch {
 			case value.IsStaleNaN(s.h.Sum):
 				stale = true
-			case histogram.IsCustomBucketsSchema(s.h.Schema):
+			case s.convertNHCB && histogram.IsCustomBucketsSchema(s.h.Schema):
 				nhcb = s.h
-			case histogram.IsExponentialSchema(s.h.Schema):
+			case s.convertNHE && histogram.IsExponentialSchema(s.h.Schema):
 				// The classic CDF is evaluated on absolute bucket counts, so
 				// integer (delta encoded) histograms go through ToFloat.
 				s.fh = s.h.ToFloat(s.fh)
@@ -1019,9 +1498,9 @@ func (s *nhcbToClassicSeriesSet) convertNHCBSeries(nhcbSeries Series, groupTS []
 			switch {
 			case value.IsStaleNaN(s.fh.Sum):
 				stale = true
-			case histogram.IsCustomBucketsSchema(s.fh.Schema):
+			case s.convertNHCB && histogram.IsCustomBucketsSchema(s.fh.Schema):
 				nhcb = s.fh
-			case histogram.IsExponentialSchema(s.fh.Schema):
+			case s.convertNHE && histogram.IsExponentialSchema(s.fh.Schema):
 				exp = s.fh
 			default:
 				stale = true
@@ -1083,7 +1562,7 @@ func (s *nhcbToClassicSeriesSet) convertNHCBSeries(nhcbSeries Series, groupTS []
 				s.seriesBounds = finalizeBounds(s.seriesBounds)
 				bounds = s.seriesBounds
 			}
-			if err := histogram.ConvertExponentialToClassic(exp, bounds, nhcbLabels, s.lsetBuilder, s.suffix, &s.seriesCache, s.emitFn); err != nil {
+			if err := histogram.ConvertExponentialToClassic(exp, bounds, expLabels, s.lsetBuilder, s.suffix, &s.seriesCache, s.emitFn); err != nil {
 				return nil, err
 			}
 		} else if err := histogram.ConvertNHCBToClassic(nhcb, nhcbLabels, s.lsetBuilder, s.suffix, &s.seriesCache, s.emitFn); err != nil {
